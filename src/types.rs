@@ -4,17 +4,12 @@ use thiserror::Error;
 
 // --- Currency ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Currency {
+    #[default]
     Sat,
     Usd,
-}
-
-impl Default for Currency {
-    fn default() -> Self {
-        Currency::Sat
-    }
 }
 
 // --- Pricing ---

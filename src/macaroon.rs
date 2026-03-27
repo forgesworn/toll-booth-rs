@@ -38,8 +38,7 @@ const RESERVED_CAVEAT_KEYS: &[&str] = &[
 
 /// HMAC-SHA256(key, data) -> 32 bytes.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -134,8 +133,7 @@ fn read_field(data: &[u8], pos: usize) -> Option<(u8, Vec<u8>, usize)> {
 /// - bytes 2..34: payment hash (32 bytes from hex)
 /// - bytes 34..66: random token ID (32 bytes)
 pub fn encode_l402_identifier(payment_hash: &str) -> Result<Vec<u8>, MacaroonError> {
-    let hash_bytes = hex::decode(payment_hash)
-        .map_err(|_| MacaroonError::InvalidPaymentHash)?;
+    let hash_bytes = hex::decode(payment_hash).map_err(|_| MacaroonError::InvalidPaymentHash)?;
     if hash_bytes.len() != 32 {
         return Err(MacaroonError::InvalidPaymentHash);
     }
@@ -324,7 +322,8 @@ impl Macaroon {
 /// (the part before `/*`). Otherwise, it requires an exact match.
 pub fn match_route(pattern: &str, path: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        path.starts_with(prefix) && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
+        path.starts_with(prefix)
+            && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
     } else {
         pattern == path
     }
@@ -406,9 +405,7 @@ pub fn mint_macaroon(
     for caveat in custom_caveats {
         if let Some((key, _)) = parse_caveat(caveat) {
             if RESERVED_CAVEAT_KEYS.contains(&key) {
-                return Err(MacaroonError::InvalidCaveat(format!(
-                    "reserved key: {key}"
-                )));
+                return Err(MacaroonError::InvalidCaveat(format!("reserved key: {key}")));
             }
         } else {
             return Err(MacaroonError::InvalidCaveat(format!(
@@ -458,8 +455,8 @@ pub fn verify_macaroon(
     let root_key = hex::decode(root_key_hex).map_err(|_| MacaroonError::InvalidRootKey)?;
 
     // Decode base64 -> binary -> parse V2
-    let binary = base64_url_decode(macaroon_b64)
-        .map_err(|e| MacaroonError::Encoding(e.to_string()))?;
+    let binary =
+        base64_url_decode(macaroon_b64).map_err(|e| MacaroonError::Encoding(e.to_string()))?;
     let mac = Macaroon::deserialise_v2(&binary)?;
 
     // Verify HMAC signature
@@ -573,8 +570,8 @@ pub fn verify_macaroon(
 pub fn parse_macaroon_caveats(
     macaroon_b64: &str,
 ) -> Result<HashMap<String, String>, MacaroonError> {
-    let binary = base64_url_decode(macaroon_b64)
-        .map_err(|e| MacaroonError::Encoding(e.to_string()))?;
+    let binary =
+        base64_url_decode(macaroon_b64).map_err(|e| MacaroonError::Encoding(e.to_string()))?;
     let mac = Macaroon::deserialise_v2(&binary)?;
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -604,8 +601,7 @@ pub fn parse_macaroon_caveats(
 mod tests {
     use super::*;
 
-    const TEST_ROOT_KEY: &str =
-        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const TEST_ROOT_KEY: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
     const TEST_PAYMENT_HASH: &str =
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
@@ -615,7 +611,11 @@ mod tests {
         let derived_a = derive_key(&key_bytes);
         let derived_b = derive_key(&key_bytes);
         assert_eq!(derived_a, derived_b, "derive_key must be deterministic");
-        assert_ne!(derived_a.as_slice(), key_bytes.as_slice(), "derived key must differ from input");
+        assert_ne!(
+            derived_a.as_slice(),
+            key_bytes.as_slice(),
+            "derived key must differ from input"
+        );
     }
 
     #[test]
@@ -642,14 +642,8 @@ mod tests {
 
     #[test]
     fn mint_and_verify_roundtrip() {
-        let mac_b64 = mint_macaroon(
-            TEST_ROOT_KEY,
-            TEST_PAYMENT_HASH,
-            1000,
-            &[],
-            Currency::Sat,
-        )
-        .unwrap();
+        let mac_b64 =
+            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
 
         let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
         assert!(result.valid);
@@ -660,7 +654,10 @@ mod tests {
 
     #[test]
     fn mint_with_custom_caveats_returned_on_verify() {
-        let caveats = vec!["app_id = myapp123".to_string(), "tier = premium".to_string()];
+        let caveats = vec![
+            "app_id = myapp123".to_string(),
+            "tier = premium".to_string(),
+        ];
         let mac_b64 = mint_macaroon(
             TEST_ROOT_KEY,
             TEST_PAYMENT_HASH,
@@ -672,20 +669,20 @@ mod tests {
 
         let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
         assert!(result.valid);
-        assert_eq!(result.custom_caveats.get("app_id").map(|s| s.as_str()), Some("myapp123"));
-        assert_eq!(result.custom_caveats.get("tier").map(|s| s.as_str()), Some("premium"));
+        assert_eq!(
+            result.custom_caveats.get("app_id").map(|s| s.as_str()),
+            Some("myapp123")
+        );
+        assert_eq!(
+            result.custom_caveats.get("tier").map(|s| s.as_str()),
+            Some("premium")
+        );
     }
 
     #[test]
     fn verify_rejects_wrong_root_key() {
-        let mac_b64 = mint_macaroon(
-            TEST_ROOT_KEY,
-            TEST_PAYMENT_HASH,
-            1000,
-            &[],
-            Currency::Sat,
-        )
-        .unwrap();
+        let mac_b64 =
+            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
 
         let wrong_key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let result = verify_macaroon(wrong_key, &mac_b64, None).unwrap();
@@ -709,7 +706,9 @@ mod tests {
         let root_key_bytes = hex::decode(TEST_ROOT_KEY).unwrap();
         let id = encode_l402_identifier(TEST_PAYMENT_HASH).unwrap();
         let mut mac = Macaroon::create(&root_key_bytes, &id);
-        mac.add_first_party_caveat("payment_hash = deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        mac.add_first_party_caveat(
+            "payment_hash = deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
         mac.add_first_party_caveat("credit_balance = 1000");
         mac.add_first_party_caveat("currency = sat");
         mac.add_first_party_caveat("credit_balance = 9999"); // duplicate!
@@ -754,7 +753,18 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for &val in &[0u64, 1, 127, 128, 255, 256, 16383, 16384, 1_000_000, u64::MAX] {
+        for &val in &[
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            1_000_000,
+            u64::MAX,
+        ] {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf);
             let (decoded, _consumed) = decode_varint(&buf).expect("decode must succeed");
@@ -774,7 +784,14 @@ mod tests {
 
     #[test]
     fn rejects_reserved_custom_caveat_key() {
-        for reserved in &["payment_hash", "credit_balance", "currency", "route", "expires", "ip"] {
+        for reserved in &[
+            "payment_hash",
+            "credit_balance",
+            "currency",
+            "route",
+            "expires",
+            "ip",
+        ] {
             let caveat = format!("{reserved} = test");
             let result = mint_macaroon(
                 TEST_ROOT_KEY,
@@ -789,14 +806,8 @@ mod tests {
 
     #[test]
     fn usd_currency_support() {
-        let mac_b64 = mint_macaroon(
-            TEST_ROOT_KEY,
-            TEST_PAYMENT_HASH,
-            2500,
-            &[],
-            Currency::Usd,
-        )
-        .unwrap();
+        let mac_b64 =
+            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 2500, &[], Currency::Usd).unwrap();
 
         let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
         assert!(result.valid);
@@ -828,8 +839,14 @@ mod tests {
         .unwrap();
 
         let parsed = parse_macaroon_caveats(&mac_b64).unwrap();
-        assert_eq!(parsed.get("payment_hash").map(|s| s.as_str()), Some(TEST_PAYMENT_HASH));
-        assert_eq!(parsed.get("credit_balance").map(|s| s.as_str()), Some("750"));
+        assert_eq!(
+            parsed.get("payment_hash").map(|s| s.as_str()),
+            Some(TEST_PAYMENT_HASH)
+        );
+        assert_eq!(
+            parsed.get("credit_balance").map(|s| s.as_str()),
+            Some("750")
+        );
         assert_eq!(parsed.get("currency").map(|s| s.as_str()), Some("sat"));
         assert_eq!(parsed.get("app_id").map(|s| s.as_str()), Some("test123"));
     }
@@ -841,7 +858,9 @@ mod tests {
         let root_key_bytes = hex::decode(TEST_ROOT_KEY).unwrap();
         let id = encode_l402_identifier(TEST_PAYMENT_HASH).unwrap();
         let mut mac = Macaroon::create(&root_key_bytes, &id);
-        mac.add_first_party_caveat("payment_hash = deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        mac.add_first_party_caveat(
+            "payment_hash = deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
         mac.add_first_party_caveat("credit_balance = 1000");
         mac.add_first_party_caveat("currency = sat");
         mac.add_first_party_caveat("expires = 2099-01-01T00:00:00Z");
@@ -876,31 +895,43 @@ mod tests {
         // claims to be larger than the remaining buffer. This must not panic.
         let mut buf = vec![2u8]; // V2 version byte
         buf.push(FIELD_IDENTIFIER); // field type
-        // Encode a varint for a very large length (e.g. u64::MAX)
+                                    // Encode a varint for a very large length (e.g. u64::MAX)
         encode_varint(u64::MAX, &mut buf);
         // Provide only 4 bytes of actual data (far less than claimed)
         buf.extend_from_slice(b"tiny");
         buf.push(FIELD_EOS);
 
         let result = Macaroon::deserialise_v2(&buf);
-        assert!(result.is_err(), "must reject macaroon with oversized field length");
+        assert!(
+            result.is_err(),
+            "must reject macaroon with oversized field length"
+        );
     }
 
     #[test]
     fn deserialise_rejects_truncated_binary() {
         // Empty after version byte
         let result = Macaroon::deserialise_v2(&[2u8]);
-        assert!(result.is_err(), "must reject truncated macaroon (version only)");
+        assert!(
+            result.is_err(),
+            "must reject truncated macaroon (version only)"
+        );
 
         // Just the version byte and a non-EOS field type, no length
         let result2 = Macaroon::deserialise_v2(&[2u8, FIELD_IDENTIFIER]);
-        assert!(result2.is_err(), "must reject truncated macaroon (no field length)");
+        assert!(
+            result2.is_err(),
+            "must reject truncated macaroon (no field length)"
+        );
     }
 
     #[test]
     fn decode_varint_rejects_overlong_encoding() {
         // 11 continuation bytes (would imply > 70-bit shift)
         let data = [0x80u8; 11];
-        assert!(decode_varint(&data).is_none(), "must reject varint with > 10 continuation bytes");
+        assert!(
+            decode_varint(&data).is_none(),
+            "must reject varint with > 10 continuation bytes"
+        );
     }
 }

@@ -76,13 +76,9 @@ pub struct TollBoothEngine {
 
 impl TollBoothEngine {
     pub fn new(config: TollBoothConfig) -> Result<Self, TollBoothError> {
-        let free_tier: Option<Box<dyn IFreeTier>> = config.free_tier.as_ref().map(|ft| {
-            match ft {
-                FreeTierConfig::Requests(n) => Box::new(FreeTier::new(*n)) as Box<dyn IFreeTier>,
-                FreeTierConfig::Credits(n) => {
-                    Box::new(CreditFreeTier::new(*n)) as Box<dyn IFreeTier>
-                }
-            }
+        let free_tier: Option<Box<dyn IFreeTier>> = config.free_tier.as_ref().map(|ft| match ft {
+            FreeTierConfig::Requests(n) => Box::new(FreeTier::new(*n)) as Box<dyn IFreeTier>,
+            FreeTierConfig::Credits(n) => Box::new(CreditFreeTier::new(*n)) as Box<dyn IFreeTier>,
         });
 
         Ok(TollBoothEngine {
@@ -111,7 +107,9 @@ impl TollBoothEngine {
                 Some(tier) => {
                     if !is_valid_tier(tier) {
                         // Invalid tier key format -- return 402 challenge
-                        return self.build_challenge(&req.path, &pricing_entry.normalise()).await;
+                        return self
+                            .build_challenge(&req.path, &pricing_entry.normalise())
+                            .await;
                     }
                     match pricing_entry.tier_price(tier) {
                         Some(p) => p,
@@ -185,11 +183,7 @@ impl TollBoothEngine {
                             }
 
                             // Track estimated cost
-                            self.track_estimated_cost(
-                                &payment_hash,
-                                route_cost,
-                                currency,
-                            );
+                            self.track_estimated_cost(&payment_hash, route_cost, currency);
 
                             // Build response headers
                             let mut headers = HashMap::new();
@@ -223,10 +217,7 @@ impl TollBoothEngine {
                             // Zero-cost route with valid auth
                             let balance = verify_result.credit_balance.unwrap_or(0);
                             let mut headers = HashMap::new();
-                            headers.insert(
-                                "X-Credit-Balance".to_string(),
-                                balance.to_string(),
-                            );
+                            headers.insert("X-Credit-Balance".to_string(), balance.to_string());
 
                             return TollBoothResult::Proxy {
                                 upstream: self.config.upstream.clone(),
@@ -285,10 +276,7 @@ impl TollBoothEngine {
             let result = free_tier.check(&hashed_ip, route_cost);
             if result.allowed {
                 let mut headers = HashMap::new();
-                headers.insert(
-                    "X-Free-Remaining".to_string(),
-                    result.remaining.to_string(),
-                );
+                headers.insert("X-Free-Remaining".to_string(), result.remaining.to_string());
                 return TollBoothResult::Proxy {
                     upstream: self.config.upstream.clone(),
                     headers,
@@ -310,7 +298,13 @@ impl TollBoothEngine {
         let estimated = {
             let map = match self.estimated_costs.lock() {
                 Ok(m) => m,
-                Err(_) => return ReconcileResult { adjusted: false, new_balance: 0, delta: 0 },
+                Err(_) => {
+                    return ReconcileResult {
+                        adjusted: false,
+                        new_balance: 0,
+                        delta: 0,
+                    }
+                }
             };
             map.get(payment_hash).cloned()
         };
@@ -567,7 +561,9 @@ mod tests {
         let result = engine.handle(&req).await;
 
         match result {
-            TollBoothResult::Challenge { status, headers, .. } => {
+            TollBoothResult::Challenge {
+                status, headers, ..
+            } => {
                 assert_eq!(status, 402);
                 assert!(
                     headers.contains_key("WWW-Authenticate"),
@@ -672,7 +668,10 @@ mod tests {
             TollBoothResult::Challenge { status, .. } => {
                 assert_eq!(status, 402, "insufficient credit should return 402");
             }
-            other => panic!("expected Challenge for insufficient credit, got {:?}", other),
+            other => panic!(
+                "expected Challenge for insufficient credit, got {:?}",
+                other
+            ),
         }
     }
 
@@ -694,7 +693,10 @@ mod tests {
         // Reconcile: actual cost was 50, we charged 100, so refund 50
         let reconcile_result = engine.reconcile(&payment_hash, 50);
         assert!(reconcile_result.adjusted, "should adjust");
-        assert_eq!(reconcile_result.delta, 50, "delta should be 50 (overcharged)");
+        assert_eq!(
+            reconcile_result.delta, 50,
+            "delta should be 50 (overcharged)"
+        );
         // Balance was 900 after debit, + 50 refund = 950
         assert_eq!(reconcile_result.new_balance, 950);
     }
@@ -739,7 +741,11 @@ mod tests {
         let r1 = engine.handle(&req).await;
         match r1 {
             TollBoothResult::Proxy { credit_balance, .. } => {
-                assert_eq!(credit_balance, Some(900), "after 1st debit: 1000 - 100 = 900");
+                assert_eq!(
+                    credit_balance,
+                    Some(900),
+                    "after 1st debit: 1000 - 100 = 900"
+                );
             }
             other => panic!("expected Proxy for request 1, got {:?}", other),
         }
@@ -748,7 +754,11 @@ mod tests {
         let r2 = engine.handle(&req).await;
         match r2 {
             TollBoothResult::Proxy { credit_balance, .. } => {
-                assert_eq!(credit_balance, Some(800), "after 2nd debit: 900 - 100 = 800");
+                assert_eq!(
+                    credit_balance,
+                    Some(800),
+                    "after 2nd debit: 900 - 100 = 800"
+                );
             }
             other => panic!("expected Proxy for request 2, got {:?}", other),
         }
@@ -757,7 +767,11 @@ mod tests {
         let r3 = engine.handle(&req).await;
         match r3 {
             TollBoothResult::Proxy { credit_balance, .. } => {
-                assert_eq!(credit_balance, Some(700), "after 3rd debit: 800 - 100 = 700");
+                assert_eq!(
+                    credit_balance,
+                    Some(700),
+                    "after 3rd debit: 800 - 100 = 700"
+                );
             }
             other => panic!("expected Proxy for request 3, got {:?}", other),
         }
@@ -820,7 +834,10 @@ mod tests {
             service_name: Some("Maple AI".to_string()),
         });
         let mut pricing = HashMap::new();
-        pricing.insert("/v1/chat/completions".to_string(), PricingEntry::Simple(100));
+        pricing.insert(
+            "/v1/chat/completions".to_string(),
+            PricingEntry::Simple(100),
+        );
         let engine = TollBoothEngine::new(TollBoothConfig {
             storage,
             pricing,
@@ -856,7 +873,10 @@ mod tests {
                 assert_eq!(ph.len(), 64, "payment_hash must be 64 hex chars");
                 (mac.to_string(), ph.to_string())
             }
-            other => panic!("expected Challenge for unauthenticated GET, got {:?}", other),
+            other => panic!(
+                "expected Challenge for unauthenticated GET, got {:?}",
+                other
+            ),
         };
         // The macaroon from the 402 is tied to a random payment_hash (no real backend),
         // so we cannot compute its preimage. Instead we use our own known credentials
@@ -873,7 +893,9 @@ mod tests {
             tier: None,
         };
         match engine.handle(&req_head).await {
-            TollBoothResult::Challenge { status, headers, .. } => {
+            TollBoothResult::Challenge {
+                status, headers, ..
+            } => {
                 assert_eq!(status, 402);
                 assert_eq!(
                     headers.get("X-L402-Price-Sats").map(|s| s.as_str()),
@@ -894,14 +916,9 @@ mod tests {
         let preimage_bytes = [0xDE_u8; 32];
         let preimage_hex = hex::encode(preimage_bytes);
         let payment_hash = hex::encode(Sha256::digest(preimage_bytes));
-        let macaroon_b64 = macaroon::mint_macaroon(
-            &test_root_key(),
-            &payment_hash,
-            1000,
-            &[],
-            Currency::Sat,
-        )
-        .unwrap();
+        let macaroon_b64 =
+            macaroon::mint_macaroon(&test_root_key(), &payment_hash, 1000, &[], Currency::Sat)
+                .unwrap();
 
         let auth_value = format!("L402 {macaroon_b64}:{preimage_hex}");
         let make_paid_req = || {
@@ -919,8 +936,16 @@ mod tests {
         // Request 1: 1000 - 100 = 900
         let r1 = engine.handle(&make_paid_req()).await;
         match r1 {
-            TollBoothResult::Proxy { credit_balance, payment_hash: ph, .. } => {
-                assert_eq!(credit_balance, Some(900), "after 1st request: 1000 - 100 = 900");
+            TollBoothResult::Proxy {
+                credit_balance,
+                payment_hash: ph,
+                ..
+            } => {
+                assert_eq!(
+                    credit_balance,
+                    Some(900),
+                    "after 1st request: 1000 - 100 = 900"
+                );
                 assert_eq!(ph.as_deref(), Some(payment_hash.as_str()));
             }
             other => panic!("expected Proxy for request 1, got {:?}", other),
@@ -930,7 +955,11 @@ mod tests {
         let r2 = engine.handle(&make_paid_req()).await;
         match r2 {
             TollBoothResult::Proxy { credit_balance, .. } => {
-                assert_eq!(credit_balance, Some(800), "after 2nd request: 900 - 100 = 800");
+                assert_eq!(
+                    credit_balance,
+                    Some(800),
+                    "after 2nd request: 900 - 100 = 800"
+                );
             }
             other => panic!("expected Proxy for request 2, got {:?}", other),
         }
@@ -939,7 +968,11 @@ mod tests {
         let r3 = engine.handle(&make_paid_req()).await;
         match r3 {
             TollBoothResult::Proxy { credit_balance, .. } => {
-                assert_eq!(credit_balance, Some(700), "after 3rd request: 800 - 100 = 700");
+                assert_eq!(
+                    credit_balance,
+                    Some(700),
+                    "after 3rd request: 800 - 100 = 700"
+                );
             }
             other => panic!("expected Proxy for request 3, got {:?}", other),
         }
@@ -949,7 +982,10 @@ mod tests {
             TollBoothResult::Challenge { status, .. } => {
                 assert_eq!(status, 402, "unauthenticated request must still return 402");
             }
-            other => panic!("expected Challenge for unauthenticated request, got {:?}", other),
+            other => panic!(
+                "expected Challenge for unauthenticated request, got {:?}",
+                other
+            ),
         }
     }
 

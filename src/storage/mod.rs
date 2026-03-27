@@ -1,6 +1,6 @@
-pub mod traits;
 pub mod memory;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-pub use traits::StorageBackend;
+pub mod traits;
 pub use memory::MemoryStorage;
+pub use traits::StorageBackend;

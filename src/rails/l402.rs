@@ -62,14 +62,17 @@ impl PaymentRail for L402Rail {
         match req.header("authorization") {
             Some(val) => {
                 let trimmed = val.trim();
-                trimmed.len() > 5
-                    && trimmed[..5].eq_ignore_ascii_case("l402 ")
+                trimmed.len() > 5 && trimmed[..5].eq_ignore_ascii_case("l402 ")
             }
             None => false,
         }
     }
 
-    async fn challenge(&self, route: &str, price: &PriceInfo) -> Result<ChallengeFragment, RailError> {
+    async fn challenge(
+        &self,
+        route: &str,
+        price: &PriceInfo,
+    ) -> Result<ChallengeFragment, RailError> {
         let amount = price.sats.unwrap_or(self.default_amount);
         let memo = self.service_name.as_deref().unwrap_or("L402 access");
 
@@ -100,9 +103,7 @@ impl PaymentRail for L402Rail {
         .map_err(|e| RailError::Challenge(e.to_string()))?;
 
         // Build the WWW-Authenticate header value
-        let www_auth = format!(
-            "L402 macaroon=\"{macaroon_b64}\", invoice=\"{bolt11}\""
-        );
+        let www_auth = format!("L402 macaroon=\"{macaroon_b64}\", invoice=\"{bolt11}\"");
 
         let mut headers = HashMap::new();
         headers.insert("WWW-Authenticate".to_string(), www_auth);
@@ -160,10 +161,11 @@ impl PaymentRail for L402Rail {
             now: None,
         };
 
-        let verify_result = match macaroon::verify_macaroon(&self.root_key, macaroon_b64, Some(&context)) {
-            Ok(result) => result,
-            Err(_) => return Ok(unauthenticated("")),
-        };
+        let verify_result =
+            match macaroon::verify_macaroon(&self.root_key, macaroon_b64, Some(&context)) {
+                Ok(result) => result,
+                Err(_) => return Ok(unauthenticated("")),
+            };
 
         // 5. If macaroon invalid: return unauthenticated
         let payment_hash = match verify_result.payment_hash {
@@ -192,7 +194,11 @@ impl PaymentRail for L402Rail {
 
         // 7. Lightning preimage check: SHA256(preimage_bytes) == payment_hash (timing-safe)
         let computed_hash = Sha256::digest(&preimage_bytes);
-        let lightning_valid = computed_hash.as_slice().ct_eq(&expected_hash_bytes).unwrap_u8() == 1;
+        let lightning_valid = computed_hash
+            .as_slice()
+            .ct_eq(&expected_hash_bytes)
+            .unwrap_u8()
+            == 1;
 
         // 8. Cashu fallback: if Lightning check fails, check stored settlement secret
         let preimage_valid = if lightning_valid {
@@ -232,7 +238,12 @@ impl PaymentRail for L402Rail {
 
             let credit_amount = verify_result.credit_balance.unwrap_or(0);
             self.storage
-                .settle_with_credit(&payment_hash, credit_amount, Some(&settlement_secret), currency)
+                .settle_with_credit(
+                    &payment_hash,
+                    credit_amount,
+                    Some(&settlement_secret),
+                    currency,
+                )
                 .map_err(|e| RailError::Verification(e.to_string()))?;
         }
 
@@ -327,16 +338,31 @@ mod tests {
         let fragment = rail.challenge("/api/test", &price).await.unwrap();
 
         // Should have WWW-Authenticate header containing "L402" and "macaroon="
-        let www_auth = fragment.headers.get("WWW-Authenticate").expect("missing WWW-Authenticate");
-        assert!(www_auth.starts_with("L402 "), "header must start with 'L402 '");
-        assert!(www_auth.contains("macaroon="), "header must contain macaroon=");
-        assert!(www_auth.contains("invoice="), "header must contain invoice=");
+        let www_auth = fragment
+            .headers
+            .get("WWW-Authenticate")
+            .expect("missing WWW-Authenticate");
+        assert!(
+            www_auth.starts_with("L402 "),
+            "header must start with 'L402 '"
+        );
+        assert!(
+            www_auth.contains("macaroon="),
+            "header must contain macaroon="
+        );
+        assert!(
+            www_auth.contains("invoice="),
+            "header must contain invoice="
+        );
 
         // Body should have l402 object
         let l402 = fragment.body.get("l402").expect("missing l402 body");
         assert_eq!(l402.get("scheme").and_then(|v| v.as_str()), Some("L402"));
         assert_eq!(l402.get("amount_sats").and_then(|v| v.as_u64()), Some(50));
-        assert_eq!(l402.get("route").and_then(|v| v.as_str()), Some("/api/test"));
+        assert_eq!(
+            l402.get("route").and_then(|v| v.as_str()),
+            Some("/api/test")
+        );
 
         // payment_hash should be a 64-char hex string
         let ph = l402.get("payment_hash").and_then(|v| v.as_str()).unwrap();
@@ -413,7 +439,10 @@ mod tests {
         let req = make_request(headers);
 
         let result = rail.verify(&req).await.unwrap();
-        assert!(!result.authenticated, "wrong preimage must not authenticate");
+        assert!(
+            !result.authenticated,
+            "wrong preimage must not authenticate"
+        );
         assert_eq!(result.payment_id, payment_hash);
     }
 
@@ -432,14 +461,9 @@ mod tests {
             .unwrap();
 
         // Mint a macaroon for this payment hash
-        let macaroon_b64 = macaroon::mint_macaroon(
-            &test_root_key(),
-            payment_hash,
-            2000,
-            &[],
-            Currency::Sat,
-        )
-        .unwrap();
+        let macaroon_b64 =
+            macaroon::mint_macaroon(&test_root_key(), payment_hash, 2000, &[], Currency::Sat)
+                .unwrap();
 
         // Use the settlement secret as the "preimage" (Cashu fallback path)
         let mut headers = HashMap::new();
@@ -450,7 +474,10 @@ mod tests {
         let req = make_request(headers);
 
         let result = rail.verify(&req).await.unwrap();
-        assert!(result.authenticated, "settlement secret should authenticate via Cashu fallback");
+        assert!(
+            result.authenticated,
+            "settlement secret should authenticate via Cashu fallback"
+        );
         assert_eq!(result.payment_id, payment_hash);
         assert_eq!(result.credit_balance, Some(2000));
     }
@@ -476,7 +503,10 @@ mod tests {
 
         // Second verification: already settled, should still authenticate
         let result2 = rail.verify(&req).await.unwrap();
-        assert!(result2.authenticated, "replay should still authenticate (reads existing balance)");
+        assert!(
+            result2.authenticated,
+            "replay should still authenticate (reads existing balance)"
+        );
         assert_eq!(result2.credit_balance, Some(500));
     }
 
@@ -516,7 +546,10 @@ mod tests {
         let rail = make_rail(storage);
 
         // Price with no sats field
-        let price = PriceInfo { sats: None, usd: Some(100) };
+        let price = PriceInfo {
+            sats: None,
+            usd: Some(100),
+        };
 
         let fragment = rail.challenge("/api/test", &price).await.unwrap();
         let l402 = fragment.body.get("l402").unwrap();

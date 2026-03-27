@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 
-use crate::types::{Currency, DebitResult, StorageError, StoredInvoice};
 use super::traits::StorageBackend;
+use crate::types::{Currency, DebitResult, StorageError, StoredInvoice};
 
 #[derive(Debug, Default)]
 struct BalanceRecord {
@@ -52,45 +52,92 @@ impl MemoryStorage {
 }
 
 impl StorageBackend for MemoryStorage {
-    fn credit(&self, payment_hash: &str, amount: i64, currency: Currency) -> Result<(), StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+    fn credit(
+        &self,
+        payment_hash: &str,
+        amount: i64,
+        currency: Currency,
+    ) -> Result<(), StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let record = inner.balances.entry(payment_hash.to_string()).or_default();
-        let new_balance = record.get(currency).checked_add(amount)
+        let new_balance = record
+            .get(currency)
+            .checked_add(amount)
             .ok_or_else(|| StorageError::Database("balance overflow on credit".into()))?;
         record.set(currency, new_balance);
         Ok(())
     }
 
-    fn debit(&self, payment_hash: &str, amount: i64, currency: Currency) -> Result<DebitResult, StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+    fn debit(
+        &self,
+        payment_hash: &str,
+        amount: i64,
+        currency: Currency,
+    ) -> Result<DebitResult, StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let record = inner.balances.entry(payment_hash.to_string()).or_default();
         let current = record.get(currency);
         if current >= amount {
             let remaining = current - amount;
             record.set(currency, remaining);
-            Ok(DebitResult { success: true, remaining })
+            Ok(DebitResult {
+                success: true,
+                remaining,
+            })
         } else {
-            Ok(DebitResult { success: false, remaining: current })
+            Ok(DebitResult {
+                success: false,
+                remaining: current,
+            })
         }
     }
 
     fn balance(&self, payment_hash: &str, currency: Currency) -> Result<i64, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(inner.balances.get(payment_hash).map(|r| r.get(currency)).unwrap_or(0))
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(inner
+            .balances
+            .get(payment_hash)
+            .map(|r| r.get(currency))
+            .unwrap_or(0))
     }
 
-    fn adjust_credits(&self, payment_hash: &str, delta: i64, currency: Currency) -> Result<i64, StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+    fn adjust_credits(
+        &self,
+        payment_hash: &str,
+        delta: i64,
+        currency: Currency,
+    ) -> Result<i64, StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let record = inner.balances.entry(payment_hash.to_string()).or_default();
-        let new_balance = record.get(currency).checked_add(delta)
+        let new_balance = record
+            .get(currency)
+            .checked_add(delta)
             .ok_or_else(|| StorageError::Database("balance overflow on adjust".into()))?;
         record.set(currency, new_balance);
         Ok(new_balance)
     }
 
     fn settle(&self, payment_hash: &str) -> Result<bool, StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        let record = inner.settlements.entry(payment_hash.to_string()).or_default();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let record = inner
+            .settlements
+            .entry(payment_hash.to_string())
+            .or_default();
         if record.settled {
             return Ok(false);
         }
@@ -98,44 +145,86 @@ impl StorageBackend for MemoryStorage {
         Ok(true)
     }
 
-    fn settle_with_credit(&self, payment_hash: &str, amount: i64, settlement_secret: Option<&str>, currency: Currency) -> Result<bool, StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        let settlement = inner.settlements.entry(payment_hash.to_string()).or_default();
+    fn settle_with_credit(
+        &self,
+        payment_hash: &str,
+        amount: i64,
+        settlement_secret: Option<&str>,
+        currency: Currency,
+    ) -> Result<bool, StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let settlement = inner
+            .settlements
+            .entry(payment_hash.to_string())
+            .or_default();
         if settlement.settled {
             return Ok(false);
         }
         settlement.settled = true;
         settlement.secret = settlement_secret.map(|s| s.to_string());
         let balance = inner.balances.entry(payment_hash.to_string()).or_default();
-        let new_balance = balance.get(currency).checked_add(amount)
+        let new_balance = balance
+            .get(currency)
+            .checked_add(amount)
             .ok_or_else(|| StorageError::Database("balance overflow on settle".into()))?;
         balance.set(currency, new_balance);
         Ok(true)
     }
 
     fn is_settled(&self, payment_hash: &str) -> Result<bool, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(inner.settlements.get(payment_hash).map(|r| r.settled).unwrap_or(false))
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(inner
+            .settlements
+            .get(payment_hash)
+            .map(|r| r.settled)
+            .unwrap_or(false))
     }
 
     fn get_settlement_secret(&self, payment_hash: &str) -> Result<Option<String>, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(inner.settlements.get(payment_hash).and_then(|r| r.secret.clone()))
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(inner
+            .settlements
+            .get(payment_hash)
+            .and_then(|r| r.secret.clone()))
     }
 
     fn store_invoice(&self, invoice: &StoredInvoice) -> Result<(), StorageError> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
-        inner.invoices.insert(invoice.payment_hash.clone(), invoice.clone());
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        inner
+            .invoices
+            .insert(invoice.payment_hash.clone(), invoice.clone());
         Ok(())
     }
 
     fn get_invoice(&self, payment_hash: &str) -> Result<Option<StoredInvoice>, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(inner.invoices.get(payment_hash).cloned())
     }
 
-    fn get_invoice_for_status(&self, payment_hash: &str, status_token: &str) -> Result<Option<StoredInvoice>, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+    fn get_invoice_for_status(
+        &self,
+        payment_hash: &str,
+        status_token: &str,
+    ) -> Result<Option<StoredInvoice>, StorageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         match inner.invoices.get(payment_hash) {
             None => Ok(None),
             Some(invoice) => {
@@ -152,7 +241,10 @@ impl StorageBackend for MemoryStorage {
     }
 
     fn pending_invoice_count(&self, client_ip: &str) -> Result<u64, StorageError> {
-        let inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let count = inner
             .invoices
             .values()
@@ -178,7 +270,11 @@ mod tests {
         format!("{:0>64}", n)
     }
 
-    fn make_invoice(payment_hash: &str, status_token: &str, client_ip: Option<&str>) -> StoredInvoice {
+    fn make_invoice(
+        payment_hash: &str,
+        status_token: &str,
+        client_ip: Option<&str>,
+    ) -> StoredInvoice {
         StoredInvoice {
             payment_hash: payment_hash.to_string(),
             bolt11: "lnbc1...".to_string(),
@@ -237,13 +333,20 @@ mod tests {
         let h = hash(5);
         let secret = "preimage_secret";
 
-        let settled = store.settle_with_credit(&h, 2000, Some(secret), Currency::Sat).unwrap();
+        let settled = store
+            .settle_with_credit(&h, 2000, Some(secret), Currency::Sat)
+            .unwrap();
         assert!(settled);
         assert_eq!(store.balance(&h, Currency::Sat).unwrap(), 2000);
-        assert_eq!(store.get_settlement_secret(&h).unwrap(), Some(secret.to_string()));
+        assert_eq!(
+            store.get_settlement_secret(&h).unwrap(),
+            Some(secret.to_string())
+        );
 
         // Second settle should be rejected
-        let settled_again = store.settle_with_credit(&h, 2000, Some(secret), Currency::Sat).unwrap();
+        let settled_again = store
+            .settle_with_credit(&h, 2000, Some(secret), Currency::Sat)
+            .unwrap();
         assert!(!settled_again);
         // Balance should not have doubled
         assert_eq!(store.balance(&h, Currency::Sat).unwrap(), 2000);
@@ -286,7 +389,10 @@ mod tests {
         let inv = make_invoice(&h, "tok_abc", Some("1.2.3.4"));
 
         store.store_invoice(&inv).unwrap();
-        let retrieved = store.get_invoice(&h).unwrap().expect("invoice should exist");
+        let retrieved = store
+            .get_invoice(&h)
+            .unwrap()
+            .expect("invoice should exist");
         assert_eq!(retrieved.payment_hash, h);
         assert_eq!(retrieved.amount_sats, 1000);
 
@@ -299,7 +405,7 @@ mod tests {
         let store = MemoryStorage::new();
         let h = hash(9);
         let correct_token = "correct_status_token_32chars_pad";
-        let wrong_token   = "wrong_status_token_xxxxxxxxxxxx_";
+        let wrong_token = "wrong_status_token_xxxxxxxxxxxx_";
         let inv = make_invoice(&h, correct_token, Some("10.0.0.1"));
         store.store_invoice(&inv).unwrap();
 
@@ -350,6 +456,9 @@ mod tests {
         store.credit(&h, i64::MAX, Currency::Sat).unwrap();
         // Settling with additional credit should overflow
         let result = store.settle_with_credit(&h, 1, Some("secret"), Currency::Sat);
-        assert!(result.is_err(), "settle_with_credit must reject i64 overflow");
+        assert!(
+            result.is_err(),
+            "settle_with_credit must reject i64 overflow"
+        );
     }
 }

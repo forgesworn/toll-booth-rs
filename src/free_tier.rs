@@ -25,7 +25,9 @@ pub trait IFreeTier: Send + Sync {
 fn is_plausible_ip_or_hash(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
-        && value.chars().all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
 }
 
 /// Entry for a single IP in request-count free tier.
@@ -82,12 +84,10 @@ impl IFreeTier for FreeTier {
             };
         }
 
-        let entry = map
-            .entry(ip.to_string())
-            .or_insert_with(|| IpEntry {
-                count: 0,
-                date: today.clone(),
-            });
+        let entry = map.entry(ip.to_string()).or_insert_with(|| IpEntry {
+            count: 0,
+            date: today.clone(),
+        });
 
         // If at limit, deny
         if entry.count >= self.requests_per_day {
@@ -153,11 +153,7 @@ impl IFreeTier for CreditFreeTier {
         // Zero-cost requests always pass
         if cost == 0 {
             let state = self.state.lock().unwrap();
-            let spent = state
-                .1
-                .get(ip)
-                .map(|e| e.amount)
-                .unwrap_or(0);
+            let spent = state.1.get(ip).map(|e| e.amount).unwrap_or(0);
             return FreeTierResult {
                 allowed: true,
                 remaining: self.credits_per_day.saturating_sub(spent),
@@ -183,12 +179,10 @@ impl IFreeTier for CreditFreeTier {
             };
         }
 
-        let entry = map
-            .entry(ip.to_string())
-            .or_insert_with(|| SpentEntry {
-                amount: 0,
-                date: today.clone(),
-            });
+        let entry = map.entry(ip.to_string()).or_insert_with(|| SpentEntry {
+            amount: 0,
+            date: today.clone(),
+        });
 
         let remaining_budget = self.credits_per_day.saturating_sub(entry.amount);
 
@@ -324,7 +318,10 @@ mod tests {
 
         // Spend 600 (total 1000, at limit)
         let result2 = tier.check("172.16.0.1", 600);
-        assert_eq!(result2.allowed, true, "Should allow 600 sats (reaches limit)");
+        assert_eq!(
+            result2.allowed, true,
+            "Should allow 600 sats (reaches limit)"
+        );
         assert_eq!(
             result2.remaining, 0,
             "Should have 0 remaining after spending 1000 total"
@@ -348,10 +345,7 @@ mod tests {
 
         // Zero-cost should still pass even after budget exhausted
         let result = tier.check("203.0.113.1", 0);
-        assert_eq!(
-            result.allowed, true,
-            "Zero-cost request should always pass"
-        );
+        assert_eq!(result.allowed, true, "Zero-cost request should always pass");
         assert_eq!(result.remaining, 0, "Should report 0 remaining");
 
         // Multiple zero-cost calls should work

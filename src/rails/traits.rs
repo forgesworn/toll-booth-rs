@@ -1,6 +1,6 @@
+use crate::types::{Currency, PriceInfo, RailError, TollBoothRequest};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use crate::types::{Currency, PriceInfo, RailError, TollBoothRequest};
 
 #[derive(Debug, Clone)]
 pub struct ChallengeFragment {
@@ -30,6 +30,10 @@ pub trait PaymentRail: Send + Sync {
     fn rail_type(&self) -> &str;
     fn credit_supported(&self) -> bool;
     fn detect(&self, req: &TollBoothRequest) -> bool;
-    async fn challenge(&self, route: &str, price: &PriceInfo) -> Result<ChallengeFragment, RailError>;
+    async fn challenge(
+        &self,
+        route: &str,
+        price: &PriceInfo,
+    ) -> Result<ChallengeFragment, RailError>;
     async fn verify(&self, req: &TollBoothRequest) -> Result<RailVerifyResult, RailError>;
 }

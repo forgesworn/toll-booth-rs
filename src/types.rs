@@ -24,11 +24,17 @@ pub struct PriceInfo {
 
 impl PriceInfo {
     pub fn sats(amount: u64) -> Self {
-        PriceInfo { sats: Some(amount), usd: None }
+        PriceInfo {
+            sats: Some(amount),
+            usd: None,
+        }
     }
 
     pub fn usd(amount: u64) -> Self {
-        PriceInfo { sats: None, usd: Some(amount) }
+        PriceInfo {
+            sats: None,
+            usd: Some(amount),
+        }
     }
 
     pub fn amount_for(&self, currency: Currency) -> u64 {

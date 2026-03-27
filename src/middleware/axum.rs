@@ -86,8 +86,7 @@ where
                 // -------------------------------------------------------
                 // Allowed — inject headers and forward to the inner handler
                 // -------------------------------------------------------
-                TollBoothResult::Pass { headers, .. }
-                | TollBoothResult::Proxy { headers, .. } => {
+                TollBoothResult::Pass { headers, .. } | TollBoothResult::Proxy { headers, .. } => {
                     // Inject toll-booth headers into the request extensions
                     // so downstream handlers can inspect them if needed.
                     let mut req = req;
@@ -119,7 +118,11 @@ where
                 // -------------------------------------------------------
                 // Challenge — short-circuit with 402
                 // -------------------------------------------------------
-                TollBoothResult::Challenge { status, headers, body } => {
+                TollBoothResult::Challenge {
+                    status,
+                    headers,
+                    body,
+                } => {
                     let status_code = http::StatusCode::from_u16(status)
                         .unwrap_or(http::StatusCode::PAYMENT_REQUIRED);
 
@@ -176,7 +179,13 @@ fn extract_request(req: &Request<Body>) -> TollBoothRequest {
 
     let tier = headers.get("x-toll-tier").cloned();
 
-    TollBoothRequest { method, path, headers, ip, tier }
+    TollBoothRequest {
+        method,
+        path,
+        headers,
+        ip,
+        tier,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,14 +246,9 @@ mod tests {
         let preimage_bytes = [0xABu8; 32];
         let preimage_hex = hex::encode(preimage_bytes);
         let payment_hash = hex::encode(Sha256::digest(preimage_bytes));
-        let macaroon_b64 = macaroon::mint_macaroon(
-            &test_root_key(),
-            &payment_hash,
-            1000,
-            &[],
-            Currency::Sat,
-        )
-        .unwrap();
+        let macaroon_b64 =
+            macaroon::mint_macaroon(&test_root_key(), &payment_hash, 1000, &[], Currency::Sat)
+                .unwrap();
         format!("L402 {macaroon_b64}:{preimage_hex}")
     }
 
@@ -263,10 +267,7 @@ mod tests {
     async fn test_unpriced_passes_through() {
         let app = build_app(make_engine());
 
-        let request = Request::builder()
-            .uri("/free")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/free").body(Body::empty()).unwrap();
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -328,8 +329,9 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
 
-        let body_bytes =
-            axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
         assert!(

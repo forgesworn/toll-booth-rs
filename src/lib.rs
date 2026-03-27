@@ -2,7 +2,6 @@ pub mod types;
 pub mod macaroon;
 pub mod engine;
 pub mod free_tier;
-pub mod geo_fence;
 
 pub mod rails;
 pub mod backends;

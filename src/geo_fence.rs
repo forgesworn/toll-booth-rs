@@ -1,1 +1,0 @@
-// TODO: geo fence implementation

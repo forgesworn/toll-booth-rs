@@ -13,4 +13,4 @@ pub mod middleware;
 
 // Re-export key types
 pub use types::*;
-pub use engine::{TollBoothConfig, TollBoothEngine};
+pub use engine::{FreeTierConfig, TollBoothConfig, TollBoothEngine};

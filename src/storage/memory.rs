@@ -55,7 +55,9 @@ impl StorageBackend for MemoryStorage {
     fn credit(&self, payment_hash: &str, amount: i64, currency: Currency) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
         let record = inner.balances.entry(payment_hash.to_string()).or_default();
-        record.set(currency, record.get(currency) + amount);
+        let new_balance = record.get(currency).checked_add(amount)
+            .ok_or_else(|| StorageError::Database("balance overflow on credit".into()))?;
+        record.set(currency, new_balance);
         Ok(())
     }
 
@@ -80,7 +82,8 @@ impl StorageBackend for MemoryStorage {
     fn adjust_credits(&self, payment_hash: &str, delta: i64, currency: Currency) -> Result<i64, StorageError> {
         let mut inner = self.inner.lock().map_err(|e| StorageError::Database(e.to_string()))?;
         let record = inner.balances.entry(payment_hash.to_string()).or_default();
-        let new_balance = record.get(currency) + delta;
+        let new_balance = record.get(currency).checked_add(delta)
+            .ok_or_else(|| StorageError::Database("balance overflow on adjust".into()))?;
         record.set(currency, new_balance);
         Ok(new_balance)
     }
@@ -104,7 +107,9 @@ impl StorageBackend for MemoryStorage {
         settlement.settled = true;
         settlement.secret = settlement_secret.map(|s| s.to_string());
         let balance = inner.balances.entry(payment_hash.to_string()).or_default();
-        balance.set(currency, balance.get(currency) + amount);
+        let new_balance = balance.get(currency).checked_add(amount)
+            .ok_or_else(|| StorageError::Database("balance overflow on settle".into()))?;
+        balance.set(currency, new_balance);
         Ok(true)
     }
 
@@ -310,5 +315,41 @@ mod tests {
         let short_token = "short";
         let not_found_short = store.get_invoice_for_status(&h, short_token).unwrap();
         assert!(not_found_short.is_none());
+    }
+
+    // -- Security: balance overflow protection --
+
+    #[test]
+    fn credit_overflow_returns_error() {
+        let store = MemoryStorage::new();
+        let h = hash(20);
+        store.credit(&h, i64::MAX, Currency::Sat).unwrap();
+        // Adding 1 more should overflow and return an error, not wrap
+        let result = store.credit(&h, 1, Currency::Sat);
+        assert!(result.is_err(), "credit must reject i64 overflow");
+        // Balance should remain at i64::MAX (unchanged)
+        assert_eq!(store.balance(&h, Currency::Sat).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn adjust_credits_overflow_returns_error() {
+        let store = MemoryStorage::new();
+        let h = hash(21);
+        store.credit(&h, i64::MAX, Currency::Sat).unwrap();
+        let result = store.adjust_credits(&h, 1, Currency::Sat);
+        assert!(result.is_err(), "adjust_credits must reject i64 overflow");
+        // Balance unchanged
+        assert_eq!(store.balance(&h, Currency::Sat).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn settle_with_credit_overflow_returns_error() {
+        let store = MemoryStorage::new();
+        let h = hash(22);
+        // Pre-credit to near max
+        store.credit(&h, i64::MAX, Currency::Sat).unwrap();
+        // Settling with additional credit should overflow
+        let result = store.settle_with_credit(&h, 1, Some("secret"), Currency::Sat);
+        assert!(result.is_err(), "settle_with_credit must reject i64 overflow");
     }
 }

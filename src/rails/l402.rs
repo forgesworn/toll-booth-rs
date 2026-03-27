@@ -88,7 +88,8 @@ impl PaymentRail for L402Rail {
         };
 
         // Mint a credit-balance macaroon
-        let credit_balance = amount as i64;
+        let credit_balance = i64::try_from(amount)
+            .map_err(|_| RailError::Challenge("amount exceeds i64 range".to_string()))?;
         let macaroon_b64 = macaroon::mint_macaroon(
             &self.root_key,
             &payment_hash,

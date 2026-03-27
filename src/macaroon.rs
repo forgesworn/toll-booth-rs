@@ -116,8 +116,9 @@ fn read_field(data: &[u8], pos: usize) -> Option<(u8, Vec<u8>, usize)> {
         return Some((FIELD_EOS, Vec::new(), pos + 1));
     }
     let (len, consumed) = decode_varint(&data[pos + 1..])?;
+    let field_len: usize = usize::try_from(len).ok()?;
     let start = pos + 1 + consumed;
-    let end = start + len as usize;
+    let end = start.checked_add(field_len)?;
     if end > data.len() {
         return None;
     }
@@ -865,5 +866,41 @@ mod tests {
         };
         let result2 = verify_macaroon(TEST_ROOT_KEY, &mac_b64, Some(&ctx_after)).unwrap();
         assert!(!result2.valid, "should be invalid after expiry");
+    }
+
+    // -- Security: crafted macaroon binary robustness --
+
+    #[test]
+    fn read_field_rejects_oversized_varint_length() {
+        // Craft a V2 macaroon binary with a field whose varint-encoded length
+        // claims to be larger than the remaining buffer. This must not panic.
+        let mut buf = vec![2u8]; // V2 version byte
+        buf.push(FIELD_IDENTIFIER); // field type
+        // Encode a varint for a very large length (e.g. u64::MAX)
+        encode_varint(u64::MAX, &mut buf);
+        // Provide only 4 bytes of actual data (far less than claimed)
+        buf.extend_from_slice(b"tiny");
+        buf.push(FIELD_EOS);
+
+        let result = Macaroon::deserialise_v2(&buf);
+        assert!(result.is_err(), "must reject macaroon with oversized field length");
+    }
+
+    #[test]
+    fn deserialise_rejects_truncated_binary() {
+        // Empty after version byte
+        let result = Macaroon::deserialise_v2(&[2u8]);
+        assert!(result.is_err(), "must reject truncated macaroon (version only)");
+
+        // Just the version byte and a non-EOS field type, no length
+        let result2 = Macaroon::deserialise_v2(&[2u8, FIELD_IDENTIFIER]);
+        assert!(result2.is_err(), "must reject truncated macaroon (no field length)");
+    }
+
+    #[test]
+    fn decode_varint_rejects_overlong_encoding() {
+        // 11 continuation bytes (would imply > 70-bit shift)
+        let data = [0x80u8; 11];
+        assert!(decode_varint(&data).is_none(), "must reject varint with > 10 continuation bytes");
     }
 }

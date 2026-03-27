@@ -308,7 +308,10 @@ impl TollBoothEngine {
     /// Reconcile estimated vs actual cost after the upstream responds.
     pub fn reconcile(&self, payment_hash: &str, actual_cost: u64) -> ReconcileResult {
         let estimated = {
-            let map = self.estimated_costs.lock().unwrap();
+            let map = match self.estimated_costs.lock() {
+                Ok(m) => m,
+                Err(_) => return ReconcileResult { adjusted: false, new_balance: 0, delta: 0 },
+            };
             map.get(payment_hash).cloned()
         };
 
@@ -319,7 +322,9 @@ impl TollBoothEngine {
                 delta: 0,
             },
             Some(est) => {
-                let delta = est.cost as i64 - actual_cost as i64;
+                let est_i64 = i64::try_from(est.cost).unwrap_or(i64::MAX);
+                let actual_i64 = i64::try_from(actual_cost).unwrap_or(i64::MAX);
+                let delta = est_i64.saturating_sub(actual_i64);
                 if delta == 0 {
                     return ReconcileResult {
                         adjusted: false,
@@ -354,7 +359,10 @@ impl TollBoothEngine {
     // -----------------------------------------------------------------------
 
     fn track_estimated_cost(&self, payment_hash: &str, cost: u64, currency: Currency) {
-        let mut map = self.estimated_costs.lock().unwrap();
+        let mut map = match self.estimated_costs.lock() {
+            Ok(m) => m,
+            Err(_) => return, // poisoned mutex -- skip tracking rather than panic
+        };
 
         // Auto-evict expired entries when approaching capacity
         if map.len() >= MAX_ESTIMATED_ENTRIES {
@@ -943,5 +951,25 @@ mod tests {
             }
             other => panic!("expected Challenge for unauthenticated request, got {:?}", other),
         }
+    }
+
+    // -- Security: reconcile does not overflow on extreme u64 values --
+
+    #[tokio::test]
+    async fn test_reconcile_extreme_values_no_overflow() {
+        let engine = make_engine(None);
+        let (auth_header, payment_hash, _) = make_l402_auth_header(1000);
+
+        // Authenticate to populate estimated_costs
+        let req = make_request("GET", "/api/test", Some(&auth_header));
+        engine.handle(&req).await;
+
+        // Reconcile with u64::MAX as actual cost -- must not panic or wrap
+        let result = engine.reconcile(&payment_hash, u64::MAX);
+        // The delta should be clamped via saturating_sub, not wrap around
+        assert!(
+            result.delta <= 0,
+            "delta must not be positive when actual_cost is huge"
+        );
     }
 }

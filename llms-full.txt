@@ -1,0 +1,655 @@
+# toll-booth -- Complete API Reference
+
+> L402 payment middleware for Rust. Gates any HTTP API behind Lightning payments.
+
+toll-booth is a Rust crate that adds HTTP 402 payment gating to any API using the L402 protocol (macaroons + Lightning invoices). It verifies payments via preimage, manages credit balances, supports free tiers, tiered pricing, and cost reconciliation. Ships as a Tower Layer for axum.
+
+Source: https://github.com/forgesworn/toll-booth-rs
+Licence: MIT
+
+---
+
+## Cargo.toml
+
+```toml
+[dependencies]
+toll-booth = { version = "0.1", features = ["l402", "axum-middleware"] }
+```
+
+### Feature flags
+
+| Feature           | Default | Dependencies                             | What it enables                          |
+|-------------------|---------|------------------------------------------|------------------------------------------|
+| `l402`            | yes     | (none extra)                             | L402 payment rail                        |
+| `axum-middleware` | yes     | axum 0.8, tower 0.5, http 1             | Tower Layer for axum                     |
+| `sqlite`          | yes     | rusqlite 0.34 (bundled)                  | SQLite storage backend                   |
+| `phoenixd`        | no      | reqwest 0.12                             | Phoenixd Lightning node backend          |
+
+### Always-included dependencies
+
+hmac 0.12, sha2 0.10, subtle 2.6, rand 0.8, hex 0.4, base64 0.22, serde 1, serde_json 1, chrono 0.4, async-trait 0.1, regex 1, once_cell 1, thiserror 2.
+
+---
+
+## Public re-exports (src/lib.rs)
+
+```rust
+pub use types::*;
+pub use engine::{FreeTierConfig, TollBoothConfig, TollBoothEngine};
+pub use storage::{StorageBackend, MemoryStorage};
+pub use backends::LightningBackend;
+pub use rails::{PaymentRail, L402Rail, L402RailConfig, ChallengeFragment, RailVerifyResult, PaymentMode};
+#[cfg(feature = "axum-middleware")]
+pub use middleware::TollBoothLayer;
+```
+
+---
+
+## Core types (src/types.rs)
+
+### Currency
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum Currency {
+    #[default]
+    Sat,
+    Usd,
+}
+```
+
+### PriceInfo
+
+```rust
+pub struct PriceInfo {
+    pub sats: Option<u64>,
+    pub usd: Option<u64>,
+}
+
+impl PriceInfo {
+    pub fn sats(amount: u64) -> Self;
+    pub fn usd(amount: u64) -> Self;
+    pub fn amount_for(&self, currency: Currency) -> u64;
+}
+```
+
+### PricingEntry
+
+```rust
+pub enum PricingEntry {
+    Simple(u64),                        // sats
+    Detailed(PriceInfo),                // sats + usd
+    Tiered(HashMap<String, u64>),       // tier_key -> sats
+}
+
+impl PricingEntry {
+    pub fn normalise(&self) -> PriceInfo;  // resolves to PriceInfo
+    pub fn is_tiered(&self) -> bool;
+    pub fn tier_price(&self, tier: &str) -> Option<PriceInfo>;
+}
+```
+
+### TollBoothRequest
+
+```rust
+pub struct TollBoothRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: HashMap<String, String>,
+    pub ip: String,
+    pub tier: Option<String>,
+}
+
+impl TollBoothRequest {
+    pub fn header(&self, name: &str) -> Option<&str>;  // case-insensitive lookup
+}
+```
+
+### TollBoothResult
+
+```rust
+pub enum TollBoothResult {
+    Proxy {
+        upstream: String,
+        headers: HashMap<String, String>,
+        payment_hash: Option<String>,
+        estimated_cost: Option<u64>,
+        credit_balance: Option<i64>,
+        free_remaining: Option<u64>,
+        tier: Option<String>,
+    },
+    Challenge {
+        status: u16,                        // always 402
+        headers: HashMap<String, String>,   // includes WWW-Authenticate
+        body: serde_json::Value,            // includes l402 object
+    },
+    Pass {
+        upstream: String,
+        headers: HashMap<String, String>,
+    },
+    Blocked {
+        status: u16,
+        body: serde_json::Value,
+    },
+}
+```
+
+### Invoice types
+
+```rust
+pub struct Invoice {
+    pub bolt11: String,
+    pub payment_hash: String,
+}
+
+pub struct InvoiceStatus {
+    pub paid: bool,
+    pub preimage: Option<String>,
+}
+
+pub struct StoredInvoice {
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub amount_sats: u64,
+    pub macaroon: String,
+    pub status_token: String,
+    pub created_at: String,
+    pub client_ip: Option<String>,
+}
+```
+
+### Other types
+
+```rust
+pub struct DebitResult {
+    pub success: bool,
+    pub remaining: i64,
+}
+
+pub struct ReconcileResult {
+    pub adjusted: bool,
+    pub new_balance: i64,
+    pub delta: i64,
+}
+```
+
+### Error types
+
+```rust
+pub enum TollBoothError {
+    Storage(StorageError),
+    Backend(BackendError),
+    Rail(RailError),
+    Config(String),
+}
+
+pub enum StorageError {
+    Database(String),
+    NotFound(String),
+}
+
+pub enum BackendError {
+    Request(String),
+    NotFound,
+    NotSupported,
+}
+
+pub enum RailError {
+    Challenge(String),
+    Verification(String),
+}
+
+pub enum MacaroonError {
+    InvalidRootKey,
+    InvalidPaymentHash,
+    Encoding(String),
+    VerificationFailed(String),
+    InvalidIdentifier(String),
+    InvalidCaveat(String),
+}
+```
+
+### Utility functions
+
+```rust
+pub fn is_valid_payment_hash(s: &str) -> bool;  // 64 hex chars
+pub fn hash_ip(ip: &str) -> String;              // SHA256(date:ip), truncated to 16 bytes
+pub fn is_valid_tier(tier: &str) -> bool;         // lowercase alphanumeric + _ + -, max 32 chars
+```
+
+---
+
+## Engine (src/engine.rs)
+
+### FreeTierConfig
+
+```rust
+pub enum FreeTierConfig {
+    Requests(u64),  // N free requests per day per IP
+    Credits(u64),   // N free sats per day per IP
+}
+```
+
+### TollBoothConfig
+
+```rust
+pub struct TollBoothConfig {
+    pub storage: Arc<dyn StorageBackend>,
+    pub pricing: HashMap<String, PricingEntry>,
+    pub upstream: String,
+    pub root_key: String,                          // 32-byte hex
+    pub rails: Vec<Box<dyn PaymentRail>>,
+    pub free_tier: Option<FreeTierConfig>,
+    pub service_name: Option<String>,
+}
+
+impl Default for TollBoothConfig { ... }  // empty/zero defaults
+```
+
+### TollBoothEngine
+
+```rust
+pub struct TollBoothEngine { /* private */ }
+
+impl TollBoothEngine {
+    pub fn new(config: TollBoothConfig) -> Result<Self, TollBoothError>;
+    pub async fn handle(&self, req: &TollBoothRequest) -> TollBoothResult;
+    pub fn reconcile(&self, payment_hash: &str, actual_cost: u64) -> ReconcileResult;
+}
+```
+
+**`handle()` flow:**
+1. Check if route exists in pricing table. If not, return `Pass`.
+2. Resolve price (with tier support if `X-Toll-Tier` header present).
+3. HEAD requests return 402 with price headers only (`X-L402-Price-Sats`, `X-L402-Price-Usd`).
+4. Iterate payment rails. For each rail that detects credentials:
+   - Verify credentials
+   - If authenticated with Credit mode: debit from storage, return `Proxy` with `X-Credit-Balance`
+   - If authenticated with PerRequest/Session mode: settle once, return `Proxy`
+5. If no rail authenticated: check free tier. If allowed, return `Proxy` with `X-Free-Remaining`.
+6. If all else fails: generate 402 `Challenge` from all rails.
+
+**`reconcile()` flow:**
+- Compares estimated cost (tracked per payment_hash for 60s) against actual cost
+- If overcharged: refunds the difference via `storage.adjust_credits()`
+- Returns `ReconcileResult { adjusted, new_balance, delta }`
+
+---
+
+## Payment rails (src/rails/)
+
+### PaymentRail trait
+
+```rust
+#[async_trait]
+pub trait PaymentRail: Send + Sync {
+    fn rail_type(&self) -> &str;
+    fn credit_supported(&self) -> bool;
+    fn detect(&self, req: &TollBoothRequest) -> bool;
+    async fn challenge(&self, route: &str, price: &PriceInfo) -> Result<ChallengeFragment, RailError>;
+    async fn verify(&self, req: &TollBoothRequest) -> Result<RailVerifyResult, RailError>;
+}
+```
+
+### Supporting types
+
+```rust
+pub struct ChallengeFragment {
+    pub headers: HashMap<String, String>,
+    pub body: serde_json::Value,
+}
+
+pub struct RailVerifyResult {
+    pub authenticated: bool,
+    pub payment_id: String,
+    pub mode: PaymentMode,
+    pub credit_balance: Option<i64>,
+    pub currency: Currency,
+    pub custom_caveats: HashMap<String, String>,
+}
+
+pub enum PaymentMode {
+    PerRequest,
+    Credit,
+    Session,
+}
+```
+
+### L402Rail (src/rails/l402.rs)
+
+```rust
+pub struct L402RailConfig {
+    pub root_key: String,                              // 32-byte hex
+    pub storage: Arc<dyn StorageBackend>,
+    pub default_amount: u64,                           // fallback sats when price has no sats field
+    pub backend: Option<Arc<dyn LightningBackend>>,    // None = random payment_hash (dev mode)
+    pub service_name: Option<String>,                  // memo for invoices
+}
+
+pub struct L402Rail { /* private */ }
+
+impl L402Rail {
+    pub fn new(config: L402RailConfig) -> Self;
+}
+```
+
+**Detection:** looks for `Authorization: L402 ...` header (case-insensitive).
+
+**Challenge:** generates `WWW-Authenticate: L402 macaroon="<b64>", invoice="<bolt11>"` and a JSON body:
+```json
+{
+  "l402": {
+    "scheme": "L402",
+    "description": "Payment required: <service_name>",
+    "invoice": "<bolt11>",
+    "macaroon": "<url-safe-base64>",
+    "payment_hash": "<64 hex chars>",
+    "amount_sats": 100,
+    "route": "/v1/chat"
+  }
+}
+```
+
+**Verification flow:**
+1. Extract `Authorization: L402 <macaroon_b64>:<preimage_hex>`
+2. Verify macaroon HMAC signature against root key (constant-time)
+3. Check preimage: SHA256(preimage) == payment_hash (constant-time via `subtle`)
+4. Cashu fallback: if Lightning preimage fails, check stored settlement secret
+5. First-time settlement: credit balance from macaroon, store settlement secret
+6. Return balance from storage
+
+---
+
+## Lightning backends (src/backends/)
+
+### LightningBackend trait
+
+```rust
+#[async_trait]
+pub trait LightningBackend: Send + Sync {
+    async fn create_invoice(&self, amount_sats: u64, memo: Option<&str>) -> Result<Invoice, BackendError>;
+    async fn check_invoice(&self, payment_hash: &str) -> Result<InvoiceStatus, BackendError>;
+    async fn send_payment(&self, _bolt11: &str) -> Result<PaymentResult, BackendError> {
+        Err(BackendError::NotSupported)  // default impl
+    }
+}
+
+pub struct PaymentResult {
+    pub preimage: String,
+}
+```
+
+### PhoenixdBackend (feature: `phoenixd`)
+
+Connects to a Phoenixd Lightning node via HTTP API.
+
+---
+
+## Storage backends (src/storage/)
+
+### StorageBackend trait
+
+```rust
+pub trait StorageBackend: Send + Sync {
+    // Balance management
+    fn credit(&self, payment_hash: &str, amount: i64, currency: Currency) -> Result<(), StorageError>;
+    fn debit(&self, payment_hash: &str, amount: i64, currency: Currency) -> Result<DebitResult, StorageError>;
+    fn balance(&self, payment_hash: &str, currency: Currency) -> Result<i64, StorageError>;
+    fn adjust_credits(&self, payment_hash: &str, delta: i64, currency: Currency) -> Result<i64, StorageError>;
+
+    // Settlement
+    fn settle(&self, payment_hash: &str) -> Result<bool, StorageError>;
+    fn settle_with_credit(&self, payment_hash: &str, amount: i64, settlement_secret: Option<&str>, currency: Currency) -> Result<bool, StorageError>;
+    fn is_settled(&self, payment_hash: &str) -> Result<bool, StorageError>;
+    fn get_settlement_secret(&self, payment_hash: &str) -> Result<Option<String>, StorageError>;
+
+    // Invoice management
+    fn store_invoice(&self, invoice: &StoredInvoice) -> Result<(), StorageError>;
+    fn get_invoice(&self, payment_hash: &str) -> Result<Option<StoredInvoice>, StorageError>;
+    fn get_invoice_for_status(&self, payment_hash: &str, status_token: &str) -> Result<Option<StoredInvoice>, StorageError>;
+    fn pending_invoice_count(&self, client_ip: &str) -> Result<u64, StorageError>;
+
+    // Maintenance
+    fn prune_expired_invoices(&self, max_age: std::time::Duration) -> Result<u64, StorageError>;
+    fn prune_stale_records(&self, max_age: std::time::Duration) -> Result<u64, StorageError>;
+}
+```
+
+### MemoryStorage
+
+```rust
+pub struct MemoryStorage { /* private */ }
+
+impl MemoryStorage {
+    pub fn new() -> Self;
+}
+```
+
+In-memory implementation. Thread-safe via `Mutex`. Suitable for tests and prototypes. Supports dual-currency (Sat + Usd) balances per payment_hash. Has overflow protection (returns error on i64 overflow). Status token comparison uses constant-time equality.
+
+### SqliteStorage (feature: `sqlite`)
+
+SQLite-backed implementation using bundled rusqlite. No system dependency.
+
+---
+
+## axum middleware (src/middleware/axum.rs, feature: `axum-middleware`)
+
+### TollBoothLayer
+
+```rust
+pub struct TollBoothLayer { /* private */ }
+
+impl TollBoothLayer {
+    pub fn new(engine: TollBoothEngine) -> Self;
+    pub fn from_arc(engine: Arc<TollBoothEngine>) -> Self;
+}
+
+impl<S> Layer<S> for TollBoothLayer { ... }
+```
+
+**Usage:**
+```rust
+let app = axum::Router::new()
+    .route("/v1/chat", axum::routing::post(handler))
+    .layer(TollBoothLayer::new(engine));
+```
+
+**Behaviour:**
+- `Proxy` / `Pass`: injects toll-booth headers into both request (for downstream handlers) and response (for client observability), then forwards to inner service
+- `Challenge`: short-circuits with 402 status, JSON body, and `WWW-Authenticate` header
+- `Blocked`: short-circuits with 403 status and JSON body
+
+**IP extraction:** prefers `X-Forwarded-For` (first entry), falls back to `X-Real-IP`, defaults to `"unknown"`.
+
+**Tier extraction:** reads `X-Toll-Tier` header.
+
+---
+
+## Macaroon module (src/macaroon.rs)
+
+Internal macaroon implementation using V2 binary format with HMAC-SHA256.
+
+### Public functions
+
+```rust
+pub fn mint_macaroon(
+    root_key_hex: &str,       // 32-byte hex string
+    payment_hash: &str,       // 64 hex chars
+    credit_balance: i64,
+    custom_caveats: &[String], // "key = value" format
+    currency: Currency,
+) -> Result<String, MacaroonError>;  // returns URL-safe base64
+
+pub fn verify_macaroon(
+    root_key_hex: &str,
+    macaroon_b64: &str,
+    context: Option<&VerifyContext>,
+) -> Result<VerifyResult, MacaroonError>;
+
+pub fn parse_macaroon_caveats(
+    macaroon_b64: &str,
+) -> Result<HashMap<String, String>, MacaroonError>;
+```
+
+### VerifyContext
+
+```rust
+pub struct VerifyContext<'a> {
+    pub path: Option<&'a str>,
+    pub ip: Option<&'a str>,
+    pub now: Option<chrono::DateTime<chrono::Utc>>,
+}
+```
+
+### VerifyResult
+
+```rust
+pub struct VerifyResult {
+    pub valid: bool,
+    pub payment_hash: Option<String>,
+    pub credit_balance: Option<i64>,
+    pub currency: Currency,
+    pub custom_caveats: HashMap<String, String>,
+}
+```
+
+### Reserved caveat keys
+
+`payment_hash`, `credit_balance`, `currency`, `route`, `expires`, `ip`. Custom caveats must not use these keys.
+
+### Caveat format
+
+All caveats use `"key = value"` format (space-equals-space). Route caveats support wildcards: `route = /api/*` matches any path starting with `/api/`.
+
+### L402 Identifier format (66 bytes)
+
+- Bytes 0-1: version (uint16 BE, always 0)
+- Bytes 2-33: payment hash (32 bytes)
+- Bytes 34-65: random token ID (32 bytes)
+
+### Security properties
+
+- HMAC-SHA256 signatures with derived keys (matching JS macaroon v3 key derivation)
+- Constant-time signature comparison via `subtle::ConstantTimeEq`
+- Constant-time preimage verification
+- Constant-time status token comparison
+- Duplicate caveat key rejection
+- Reserved key injection prevention
+- Balance overflow protection (checked arithmetic)
+- IP hashing with daily salt rotation
+
+---
+
+## Free tier (src/free_tier.rs)
+
+### FreeTierConfig in engine
+
+```rust
+// In TollBoothConfig:
+free_tier: Some(FreeTierConfig::Requests(10)),  // 10 free requests per IP per day
+// or:
+free_tier: Some(FreeTierConfig::Credits(500)),   // 500 free sats per IP per day
+```
+
+**Behaviour:**
+- Request-based: counts requests per hashed IP, resets daily
+- Credit-based: tracks spent budget per hashed IP, resets daily. Zero-cost requests always pass.
+- IP validation: rejects empty, overlength (>64 chars), or non-hex/dot/colon characters
+- Capacity limit: 100,000 unique IPs per day (prevents memory exhaustion)
+
+---
+
+## Complete usage example
+
+```rust
+use std::sync::Arc;
+use toll_booth::{
+    TollBoothEngine, TollBoothConfig, FreeTierConfig,
+    L402Rail, L402RailConfig,
+    MemoryStorage,
+    TollBoothLayer,
+    PricingEntry,
+};
+
+async fn chat_handler() -> &'static str {
+    "Hello from the paid API"
+}
+
+#[tokio::main]
+async fn main() {
+    // 1. Storage
+    let storage = Arc::new(MemoryStorage::new());
+
+    // 2. L402 payment rail
+    let l402 = L402Rail::new(L402RailConfig {
+        root_key: std::env::var("L402_ROOT_KEY")
+            .expect("L402_ROOT_KEY must be a 64-char hex string"),
+        storage: storage.clone(),
+        default_amount: 100,        // sats, used when price has no sats field
+        backend: None,              // None = dev mode (random payment hashes)
+        service_name: Some("My Chat API".to_string()),
+    });
+
+    // 3. Pricing table
+    let mut pricing = std::collections::HashMap::new();
+    pricing.insert("/v1/chat".to_string(), PricingEntry::Simple(100));
+    pricing.insert("/v1/image".to_string(), PricingEntry::Simple(500));
+
+    // 4. Engine
+    let engine = TollBoothEngine::new(TollBoothConfig {
+        storage,
+        pricing,
+        upstream: "http://127.0.0.1:8080".into(),
+        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
+        rails: vec![Box::new(l402)],
+        free_tier: Some(FreeTierConfig::Requests(10)),  // 10 free per day
+        service_name: Some("My Chat API".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // 5. axum app with toll-booth middleware
+    let app = axum::Router::new()
+        .route("/v1/chat", axum::routing::post(chat_handler))
+        .layer(TollBoothLayer::new(engine));
+
+    // 6. Serve
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("Listening on :3000");
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+## L402 protocol flow
+
+```
+Client                              Server (toll-booth)
+  |                                       |
+  |-- GET /v1/chat ---------------------->|
+  |                                       | pricing table lookup: 100 sats
+  |                                       | no Authorization header
+  |                                       | free tier: check (may allow)
+  |                                       | if denied:
+  |<-- 402 Payment Required --------------|
+  |    WWW-Authenticate: L402 macaroon="...", invoice="..."
+  |    Body: { "l402": { "invoice": "lnbc1...", "macaroon": "...",
+  |            "payment_hash": "abc...", "amount_sats": 100 } }
+  |                                       |
+  |-- Pay Lightning invoice ------------->| (out of band)
+  |<-- Preimage (32 bytes hex) ----------|
+  |                                       |
+  |-- GET /v1/chat ---------------------->|
+  |   Authorization: L402 <macaroon>:<preimage_hex>
+  |                                       | verify macaroon HMAC (constant-time)
+  |                                       | verify SHA256(preimage) == payment_hash
+  |                                       | first use: settle + credit 100 sats
+  |                                       | debit 100 sats -> balance 0
+  |<-- 200 OK ----------------------------|
+  |    X-Credit-Balance: 0               |
+  |                                       |
+  |-- GET /v1/chat ---------------------->|  (same credentials)
+  |   Authorization: L402 <macaroon>:<preimage_hex>
+  |                                       | balance 0 < cost 100
+  |<-- 402 Payment Required --------------|  (new invoice)
+```

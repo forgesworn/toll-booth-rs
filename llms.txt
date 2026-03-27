@@ -1,0 +1,137 @@
+# toll-booth
+
+> L402 payment middleware for Rust. Gates any HTTP API behind Lightning payments.
+
+toll-booth is a Rust crate that adds HTTP 402 payment gating to any API. It uses the L402 protocol (macaroons + Lightning invoices) to challenge unauthenticated requests, verify payments via preimage, and manage credit balances. Designed as a Tower Layer, it drops straight into axum.
+
+## Key features
+
+- Credit-balance model: one Lightning payment funds multiple requests, with automatic debit per call
+- Bring-your-own backend: implement `LightningBackend` for any Lightning node (Phoenixd included)
+- Bring-your-own storage: implement `StorageBackend` for any store (in-memory and SQLite included)
+- Pluggable payment rails: `PaymentRail` trait supports per-request, credit, and session modes
+- Free tier: configurable free requests or free credits per IP per day (IPs hashed with daily salt)
+- Tiered pricing: per-route pricing with tier keys sent via `X-Toll-Tier` header
+- Cost reconciliation: adjust credit balances after upstream responds with actual cost
+- Custom macaroon caveats: route restrictions, IP binding, expiry, plus arbitrary key-value pairs
+- axum middleware via `TollBoothLayer` (Tower Layer/Service)
+
+## Architecture
+
+```
+Request -> TollBoothLayer -> TollBoothEngine
+                                |
+                                +-- Pricing table lookup
+                                +-- Payment rails (L402Rail, extensible)
+                                +-- Free tier fallback
+                                +-- StorageBackend (credit/debit/settle)
+                                +-- LightningBackend (invoice creation)
+                                |
+                            TollBoothResult:
+                              Proxy   -> forward to handler
+                              Challenge -> 402 + WWW-Authenticate
+                              Pass    -> unpriced route
+                              Blocked -> 403
+```
+
+## Quick start
+
+```toml
+[dependencies]
+toll-booth = { version = "0.1", features = ["l402", "axum-middleware"] }
+```
+
+```rust
+use std::sync::Arc;
+use toll_booth::{
+    TollBoothEngine, TollBoothConfig,
+    L402Rail, L402RailConfig,
+    MemoryStorage,
+    TollBoothLayer,
+    PricingEntry,
+};
+
+#[tokio::main]
+async fn main() {
+    let storage = Arc::new(MemoryStorage::new());
+
+    let l402 = L402Rail::new(L402RailConfig {
+        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
+        storage: storage.clone(),
+        default_amount: 100,
+        backend: None,
+        service_name: Some("My API".to_string()),
+    });
+
+    let mut pricing = std::collections::HashMap::new();
+    pricing.insert("/v1/chat".to_string(), PricingEntry::Simple(100));
+
+    let engine = TollBoothEngine::new(TollBoothConfig {
+        storage,
+        pricing,
+        upstream: "http://127.0.0.1:8080".into(),
+        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
+        rails: vec![Box::new(l402)],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let app = axum::Router::new()
+        .route("/v1/chat", axum::routing::post(|| async { "hello" }))
+        .layer(TollBoothLayer::new(engine));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+## Public API surface
+
+### Core types
+
+- `TollBoothEngine` -- main engine, created from `TollBoothConfig`
+- `TollBoothConfig` -- storage, pricing table, upstream URL, root key, rails, free tier
+- `TollBoothResult` -- enum: `Proxy`, `Challenge`, `Pass`, `Blocked`
+- `TollBoothRequest` -- method, path, headers, IP, optional tier
+- `PricingEntry` -- `Simple(u64)`, `Detailed(PriceInfo)`, `Tiered(HashMap<String, u64>)`
+- `FreeTierConfig` -- `Requests(u64)` or `Credits(u64)`
+- `Currency` -- `Sat` or `Usd`
+
+### Traits
+
+- `PaymentRail` -- `detect()`, `challenge()`, `verify()` for any payment scheme
+- `LightningBackend` -- `create_invoice()`, `check_invoice()`, optional `send_payment()`
+- `StorageBackend` -- `credit()`, `debit()`, `balance()`, `settle()`, invoice storage, pruning
+
+### Implementations
+
+- `L402Rail` -- L402 payment rail (macaroon + Lightning preimage verification)
+- `MemoryStorage` -- in-memory storage for tests and prototypes
+- `SqliteStorage` -- SQLite storage (feature: `sqlite`)
+- `PhoenixdBackend` -- Phoenixd Lightning node (feature: `phoenixd`)
+- `TollBoothLayer` -- Tower Layer for axum (feature: `axum-middleware`)
+
+### L402 protocol flow
+
+1. Client sends request without credentials
+2. Engine returns 402 with `WWW-Authenticate: L402 macaroon="...", invoice="..."`
+3. Client pays Lightning invoice, receives preimage
+4. Client retries with `Authorization: L402 <macaroon>:<preimage_hex>`
+5. Engine verifies SHA256(preimage) == payment_hash (constant-time)
+6. On first use, engine settles and credits the balance
+7. Subsequent requests debit from balance until exhausted
+8. Engine issues fresh 402 when balance runs out
+
+## Feature flags
+
+| Feature           | Default | What it enables                          |
+|-------------------|---------|------------------------------------------|
+| `l402`            | yes     | L402 payment rail                        |
+| `axum-middleware` | yes     | Tower Layer for axum                     |
+| `sqlite`          | yes     | SQLite storage backend (bundled)         |
+| `phoenixd`        | no      | Phoenixd Lightning node backend          |
+
+## Links
+
+- Source: https://github.com/forgesworn/toll-booth-rs
+- Licence: MIT

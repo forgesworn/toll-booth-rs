@@ -2,7 +2,18 @@
 
 L402 payment middleware for Rust. Gates any HTTP API behind Lightning payments using a bring-your-own-backend, bring-your-own-storage model. Works as a Tower `Layer`, so it drops straight into axum.
 
-## Quick Start
+One Lightning payment funds multiple API calls. The engine tracks credit balances, debits per request, and re-challenges when the balance runs out. Supports free tiers, tiered pricing, cost reconciliation, and custom macaroon caveats.
+
+## Why toll-booth?
+
+- **Credit-balance model** -- one payment buys N requests, not one. Clients top up and keep calling.
+- **Cost reconciliation** -- adjust credits after the upstream responds if actual cost differed from estimate.
+- **Free tier** -- configurable free requests or free credits per IP per day, with hashed IPs and daily rotation.
+- **Tiered pricing** -- different prices per route per tier, selected by `X-Toll-Tier` header.
+- **Pluggable everything** -- bring your own Lightning backend, storage backend, and payment rails.
+- **Security defaults** -- constant-time HMAC and preimage verification, overflow-checked arithmetic, daily-salted IP hashing.
+
+## Quick start
 
 ```toml
 [dependencies]
@@ -19,6 +30,10 @@ use toll_booth::{
     PricingEntry,
 };
 
+async fn handler() -> &'static str {
+    "Hello from the paid API"
+}
+
 #[tokio::main]
 async fn main() {
     let storage = Arc::new(MemoryStorage::new());
@@ -28,7 +43,7 @@ async fn main() {
         storage: storage.clone(),
         default_amount: 100,        // sats, used when no backend is attached
         backend: None,              // swap in PhoenixdBackend or similar
-        service_name: Some("Maple AI".to_string()),
+        service_name: Some("My API".to_string()),
     });
 
     let mut pricing = std::collections::HashMap::new();

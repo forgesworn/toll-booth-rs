@@ -2,9 +2,13 @@
 name = "toll-booth"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "L402 payment middleware for Rust. Gates any HTTP API behind Lightning payments."
 license = "MIT"
 repository = "https://github.com/forgesworn/toll-booth-rs"
+homepage = "https://github.com/forgesworn/toll-booth-rs"
+documentation = "https://docs.rs/toll-booth"
+readme = "README.md"
 keywords = ["l402", "lightning", "paywall", "middleware", "payments"]
 categories = ["web-programming", "cryptography", "authentication"]
 

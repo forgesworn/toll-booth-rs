@@ -1,5 +1,7 @@
 # toll-booth
 
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
+
 L402 payment middleware for Rust. Gates any HTTP API behind Lightning payments using a bring-your-own-backend, bring-your-own-storage model. Works as a Tower `Layer`, so it drops straight into axum.
 
 One Lightning payment funds multiple API calls. The engine tracks credit balances, debits per request, and re-challenges when the balance runs out. Supports free tiers, tiered pricing, cost reconciliation, and custom macaroon caveats.

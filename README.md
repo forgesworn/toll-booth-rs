@@ -14,6 +14,8 @@ One Lightning payment funds multiple API calls. The engine tracks credit balance
 - **Tiered pricing** -- different prices per route per tier, selected by `X-Toll-Tier` header.
 - **Pluggable everything** -- bring your own Lightning backend, storage backend, and payment rails.
 - **Security defaults** -- constant-time HMAC and preimage verification, overflow-checked arithmetic, daily-salted IP hashing.
+- **Trusted-proxy IP handling** -- `X-Forwarded-For`/`X-Real-IP` honoured only from configured trusted proxies; free tier fails closed otherwise.
+- **Zeroised key material** -- the macaroon root key is held in a `RootKey` type that redacts `Debug` output and zeroises on drop.
 
 ## Quick start
 

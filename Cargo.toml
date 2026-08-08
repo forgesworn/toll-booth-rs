@@ -16,7 +16,7 @@ categories = ["web-programming", "cryptography", "authentication"]
 default = ["l402", "sqlite", "axum-middleware"]
 l402 = []
 sqlite = ["dep:rusqlite"]
-axum-middleware = ["dep:axum", "dep:tower", "dep:http", "dep:pin-project-lite"]
+axum-middleware = ["dep:axum", "dep:tower", "dep:http", "dep:pin-project-lite", "dep:ipnet"]
 phoenixd = ["dep:reqwest"]
 
 [dependencies]
@@ -45,6 +45,9 @@ once_cell = "1"
 # Error handling
 thiserror = "2"
 
+# Secret hygiene (root key zeroisation)
+zeroize = "1"
+
 # Optional: SQLite storage
 rusqlite = { version = "0.34", features = ["bundled"], optional = true }
 
@@ -56,6 +59,7 @@ axum = { version = "0.8", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 http = { version = "1", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
+ipnet = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

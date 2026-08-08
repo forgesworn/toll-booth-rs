@@ -83,6 +83,13 @@ pub type PricingTable = HashMap<String, PricingEntry>;
 
 // --- Request / Result ---
 
+/// Sentinel client IP used when no trustworthy peer address is available.
+///
+/// The engine fails closed for this value: free-tier quota is never granted
+/// (so all unknown-peer clients cannot share one bucket) and `ip` caveats
+/// cannot match it.
+pub const UNKNOWN_IP: &str = "unknown";
+
 #[derive(Debug, Clone)]
 pub struct TollBoothRequest {
     pub method: String,
@@ -108,6 +115,11 @@ pub enum TollBoothResult {
         upstream: String,
         headers: HashMap<String, String>,
         payment_hash: Option<String>,
+        /// Unique per-request identifier for cost reconciliation.
+        /// Pass this to [`crate::engine::TollBoothEngine::reconcile`]; it is
+        /// one-shot and never reused, even for repeat requests on the same
+        /// credit account.
+        request_id: Option<String>,
         estimated_cost: Option<u64>,
         credit_balance: Option<i64>,
         free_remaining: Option<u64>,

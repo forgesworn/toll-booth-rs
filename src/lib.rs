@@ -13,6 +13,7 @@ pub mod middleware;
 // Re-export key types
 pub use backends::LightningBackend;
 pub use engine::{FreeTierConfig, TollBoothConfig, TollBoothEngine};
+pub use macaroon::RootKey;
 #[cfg(feature = "axum-middleware")]
 pub use middleware::TollBoothLayer;
 pub use rails::{

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::backends::LightningBackend;
-use crate::macaroon;
+use crate::macaroon::{self, RootKey};
 use crate::rails::traits::{ChallengeFragment, PaymentMode, PaymentRail, RailVerifyResult};
 use crate::storage::StorageBackend;
 use crate::types::{Currency, PriceInfo, RailError, TollBoothRequest};
@@ -17,7 +17,9 @@ use crate::types::{Currency, PriceInfo, RailError, TollBoothRequest};
 // ---------------------------------------------------------------------------
 
 pub struct L402RailConfig {
-    pub root_key: String,
+    /// Macaroon root key. Decoded once into zeroising memory; never held as
+    /// a plain hex string by the rail.
+    pub root_key: RootKey,
     pub storage: Arc<dyn StorageBackend>,
     pub default_amount: u64,
     pub backend: Option<Arc<dyn LightningBackend>>,
@@ -29,7 +31,7 @@ pub struct L402RailConfig {
 // ---------------------------------------------------------------------------
 
 pub struct L402Rail {
-    root_key: String,
+    root_key: RootKey,
     storage: Arc<dyn StorageBackend>,
     default_amount: u64,
     backend: Option<Arc<dyn LightningBackend>>,
@@ -273,8 +275,11 @@ mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
 
-    fn test_root_key() -> String {
-        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()
+    fn test_root_key() -> RootKey {
+        RootKey::from_hex(
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        )
+        .unwrap()
     }
 
     fn make_request(headers: HashMap<String, String>) -> TollBoothRequest {

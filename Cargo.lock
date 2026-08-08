@@ -1540,6 +1540,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "ipnet",
  "once_cell",
  "pin-project-lite",
  "rand",
@@ -1553,6 +1554,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "zeroize",
 ]
 
 [[package]]

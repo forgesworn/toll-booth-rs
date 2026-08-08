@@ -462,3 +462,137 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test utilities
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+    use crate::types::StorageError;
+
+    /// Storage wrapper that delegates to [`MemoryStorage`] but can be told to
+    /// fail `debit` and/or `settle`, simulating a storage outage.
+    pub(crate) struct FlakyStorage {
+        inner: MemoryStorage,
+        pub fail_debit: bool,
+        pub fail_settle: bool,
+    }
+
+    impl FlakyStorage {
+        pub(crate) fn new(fail_debit: bool, fail_settle: bool) -> Self {
+            FlakyStorage {
+                inner: MemoryStorage::new(),
+                fail_debit,
+                fail_settle,
+            }
+        }
+    }
+
+    fn outage<T>() -> Result<T, StorageError> {
+        Err(StorageError::Database("simulated storage outage".into()))
+    }
+
+    impl StorageBackend for FlakyStorage {
+        fn credit(
+            &self,
+            payment_hash: &str,
+            amount: i64,
+            currency: Currency,
+        ) -> Result<(), StorageError> {
+            self.inner.credit(payment_hash, amount, currency)
+        }
+
+        fn debit(
+            &self,
+            payment_hash: &str,
+            amount: i64,
+            currency: Currency,
+        ) -> Result<DebitResult, StorageError> {
+            if self.fail_debit {
+                return outage();
+            }
+            self.inner.debit(payment_hash, amount, currency)
+        }
+
+        fn balance(&self, payment_hash: &str, currency: Currency) -> Result<i64, StorageError> {
+            self.inner.balance(payment_hash, currency)
+        }
+
+        fn adjust_credits(
+            &self,
+            payment_hash: &str,
+            delta: i64,
+            currency: Currency,
+        ) -> Result<i64, StorageError> {
+            self.inner.adjust_credits(payment_hash, delta, currency)
+        }
+
+        fn settle(&self, payment_hash: &str) -> Result<bool, StorageError> {
+            if self.fail_settle {
+                return outage();
+            }
+            self.inner.settle(payment_hash)
+        }
+
+        fn settle_with_credit(
+            &self,
+            payment_hash: &str,
+            amount: i64,
+            settlement_secret: Option<&str>,
+            currency: Currency,
+        ) -> Result<bool, StorageError> {
+            self.inner
+                .settle_with_credit(payment_hash, amount, settlement_secret, currency)
+        }
+
+        fn is_settled(&self, payment_hash: &str) -> Result<bool, StorageError> {
+            self.inner.is_settled(payment_hash)
+        }
+
+        fn get_settlement_secret(
+            &self,
+            payment_hash: &str,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.get_settlement_secret(payment_hash)
+        }
+
+        fn store_invoice(&self, invoice: &StoredInvoice) -> Result<(), StorageError> {
+            self.inner.store_invoice(invoice)
+        }
+
+        fn get_invoice(
+            &self,
+            payment_hash: &str,
+        ) -> Result<Option<StoredInvoice>, StorageError> {
+            self.inner.get_invoice(payment_hash)
+        }
+
+        fn get_invoice_for_status(
+            &self,
+            payment_hash: &str,
+            status_token: &str,
+        ) -> Result<Option<StoredInvoice>, StorageError> {
+            self.inner.get_invoice_for_status(payment_hash, status_token)
+        }
+
+        fn pending_invoice_count(&self, client_ip: &str) -> Result<u64, StorageError> {
+            self.inner.pending_invoice_count(client_ip)
+        }
+
+        fn prune_expired_invoices(
+            &self,
+            max_age: std::time::Duration,
+        ) -> Result<u64, StorageError> {
+            self.inner.prune_expired_invoices(max_age)
+        }
+
+        fn prune_stale_records(
+            &self,
+            max_age: std::time::Duration,
+        ) -> Result<u64, StorageError> {
+            self.inner.prune_stale_records(max_age)
+        }
+    }
+}

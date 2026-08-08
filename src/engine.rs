@@ -5,11 +5,12 @@ use std::time::{Duration, Instant};
 use rand::RngCore;
 
 use crate::free_tier::{CreditFreeTier, FreeTier, IFreeTier};
+use crate::macaroon::RootKey;
 use crate::rails::{PaymentMode, PaymentRail};
 use crate::storage::{MemoryStorage, StorageBackend};
 use crate::types::{
     hash_ip, is_valid_tier, Currency, PriceInfo, PricingEntry, ReconcileResult, StoredInvoice,
-    TollBoothError, TollBoothRequest, TollBoothResult,
+    TollBoothError, TollBoothRequest, TollBoothResult, UNKNOWN_IP,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,10 @@ pub struct TollBoothConfig {
     pub storage: Arc<dyn StorageBackend>,
     pub pricing: HashMap<String, PricingEntry>,
     pub upstream: String,
-    pub root_key: String,
+    /// Service-level macaroon root key, if the caller needs one. Held in
+    /// zeroising memory and redacted from `Debug`. Individual rails carry
+    /// their own keys; the engine itself never reads this value.
+    pub root_key: Option<RootKey>,
     pub rails: Vec<Box<dyn PaymentRail>>,
     pub free_tier: Option<FreeTierConfig>,
     pub service_name: Option<String>,
@@ -42,7 +46,7 @@ impl Default for TollBoothConfig {
             storage: Arc::new(MemoryStorage::new()),
             pricing: HashMap::new(),
             upstream: String::new(),
-            root_key: String::new(),
+            root_key: None,
             rails: Vec::new(),
             free_tier: None,
             service_name: None,
@@ -56,6 +60,7 @@ impl Default for TollBoothConfig {
 
 #[derive(Debug, Clone)]
 struct EstimatedCost {
+    payment_hash: String,
     cost: u64,
     currency: Currency,
     timestamp: Instant,
@@ -76,6 +81,19 @@ pub struct TollBoothEngine {
 
 impl TollBoothEngine {
     pub fn new(config: TollBoothConfig) -> Result<Self, TollBoothError> {
+        // Reject tiered pricing entries without a "default" tier. Without one,
+        // normalise() silently resolves to 0 sats, which a credit-based free
+        // tier treats as an always-allowed zero-cost request.
+        for (route, entry) in &config.pricing {
+            if let PricingEntry::Tiered(tiers) = entry {
+                if !tiers.contains_key("default") {
+                    return Err(TollBoothError::Config(format!(
+                        "tiered pricing for route \"{route}\" is missing the required \"default\" tier"
+                    )));
+                }
+            }
+        }
+
         let free_tier: Option<Box<dyn IFreeTier>> = config.free_tier.as_ref().map(|ft| match ft {
             FreeTierConfig::Requests(n) => Box::new(FreeTier::new(*n)) as Box<dyn IFreeTier>,
             FreeTierConfig::Credits(n) => Box::new(CreditFreeTier::new(*n)) as Box<dyn IFreeTier>,
@@ -102,6 +120,13 @@ impl TollBoothEngine {
         };
 
         // 2. Resolve price (with tier support)
+        //
+        // SECURITY: the tier comes from the client-supplied X-Toll-Tier
+        // header and is *advisory* pricing only -- a client may select any
+        // advertised tier, including the cheapest. If a tier must be
+        // enforced for a paying client, bind it to a macaroon caveat at mint
+        // time. The middleware strips the inbound header before forwarding
+        // upstream; only server-side state may set it on the proxy request.
         let price = if pricing_entry.is_tiered() {
             match &req.tier {
                 Some(tier) => {
@@ -158,7 +183,9 @@ impl TollBoothEngine {
 
             let verify_result = match rail.verify(req).await {
                 Ok(r) => r,
-                Err(_) => break,
+                // Infrastructure failure (storage outage, backend down):
+                // fail closed rather than falling through to the free tier.
+                Err(_) => return infrastructure_error(),
             };
 
             if verify_result.authenticated {
@@ -169,21 +196,29 @@ impl TollBoothEngine {
                 match verify_result.mode {
                     PaymentMode::Credit => {
                         if route_cost > 0 {
+                            let request_id = generate_request_id();
                             let debit_result = match self.config.storage.debit(
                                 &payment_hash,
                                 route_cost as i64,
                                 currency,
                             ) {
                                 Ok(r) => r,
-                                Err(_) => break,
+                                // Storage outage: fail closed, do not grant
+                                // free access.
+                                Err(_) => return infrastructure_error(),
                             };
                             if !debit_result.success {
                                 // Insufficient balance -- fall through to challenge
                                 break;
                             }
 
-                            // Track estimated cost
-                            self.track_estimated_cost(&payment_hash, route_cost, currency);
+                            // Track estimated cost under a unique per-request id
+                            self.track_estimated_cost(
+                                &request_id,
+                                &payment_hash,
+                                route_cost,
+                                currency,
+                            );
 
                             // Build response headers
                             let mut headers = HashMap::new();
@@ -208,6 +243,7 @@ impl TollBoothEngine {
                                 upstream: self.config.upstream.clone(),
                                 headers,
                                 payment_hash: Some(payment_hash),
+                                request_id: Some(request_id),
                                 estimated_cost: Some(route_cost),
                                 credit_balance: Some(debit_result.remaining),
                                 free_remaining: None,
@@ -223,6 +259,7 @@ impl TollBoothEngine {
                                 upstream: self.config.upstream.clone(),
                                 headers,
                                 payment_hash: Some(payment_hash),
+                                request_id: None,
                                 estimated_cost: Some(0),
                                 credit_balance: Some(balance),
                                 free_remaining: None,
@@ -233,14 +270,22 @@ impl TollBoothEngine {
                     PaymentMode::PerRequest | PaymentMode::Session => {
                         let settled = match self.config.storage.settle(&payment_hash) {
                             Ok(s) => s,
-                            Err(_) => break,
+                            // Storage outage: fail closed, do not grant
+                            // free access.
+                            Err(_) => return infrastructure_error(),
                         };
                         if !settled {
                             // Already settled (replay) -- fall through to challenge
                             break;
                         }
 
-                        self.track_estimated_cost(&payment_hash, route_cost, currency);
+                        let request_id = generate_request_id();
+                        self.track_estimated_cost(
+                            &request_id,
+                            &payment_hash,
+                            route_cost,
+                            currency,
+                        );
 
                         let mut headers = HashMap::new();
                         if let Some(ref tier) = req.tier {
@@ -257,6 +302,7 @@ impl TollBoothEngine {
                             upstream: self.config.upstream.clone(),
                             headers,
                             payment_hash: Some(payment_hash),
+                            request_id: Some(request_id),
                             estimated_cost: Some(route_cost),
                             credit_balance: None,
                             free_remaining: None,
@@ -271,21 +317,29 @@ impl TollBoothEngine {
         }
 
         // 5. Free tier check (only if no rail was detected or auth failed)
+        //
+        // Fail closed when no trustworthy client IP is available (UNKNOWN_IP):
+        // bucketing every such request under one shared "unknown" key would
+        // either let an attacker rotate X-Forwarded-For values into unlimited
+        // free access or deny all unknown-peer clients together.
         if let Some(ref free_tier) = self.free_tier {
-            let hashed_ip = hash_ip(&req.ip);
-            let result = free_tier.check(&hashed_ip, route_cost);
-            if result.allowed {
-                let mut headers = HashMap::new();
-                headers.insert("X-Free-Remaining".to_string(), result.remaining.to_string());
-                return TollBoothResult::Proxy {
-                    upstream: self.config.upstream.clone(),
-                    headers,
-                    payment_hash: None,
-                    estimated_cost: None,
-                    credit_balance: None,
-                    free_remaining: Some(result.remaining),
-                    tier: None,
-                };
+            if req.ip != UNKNOWN_IP {
+                let hashed_ip = hash_ip(&req.ip);
+                let result = free_tier.check(&hashed_ip, route_cost);
+                if result.allowed {
+                    let mut headers = HashMap::new();
+                    headers.insert("X-Free-Remaining".to_string(), result.remaining.to_string());
+                    return TollBoothResult::Proxy {
+                        upstream: self.config.upstream.clone(),
+                        headers,
+                        payment_hash: None,
+                        request_id: None,
+                        estimated_cost: None,
+                        credit_balance: None,
+                        free_remaining: Some(result.remaining),
+                        tier: None,
+                    };
+                }
             }
         }
 
@@ -294,9 +348,14 @@ impl TollBoothEngine {
     }
 
     /// Reconcile estimated vs actual cost after the upstream responds.
-    pub fn reconcile(&self, payment_hash: &str, actual_cost: u64) -> ReconcileResult {
+    ///
+    /// `request_id` is the unique per-request identifier returned in
+    /// [`TollBoothResult::Proxy::request_id`]. Reconciliation is one-shot:
+    /// the estimate is removed on the first call, so repeated reconciles of
+    /// the same request cannot credit the refund multiple times.
+    pub fn reconcile(&self, request_id: &str, actual_cost: u64) -> ReconcileResult {
         let estimated = {
-            let map = match self.estimated_costs.lock() {
+            let mut map = match self.estimated_costs.lock() {
                 Ok(m) => m,
                 Err(_) => {
                     return ReconcileResult {
@@ -306,7 +365,8 @@ impl TollBoothEngine {
                     }
                 }
             };
-            map.get(payment_hash).cloned()
+            // One-shot: remove the entry so it can never be refunded twice.
+            map.remove(request_id)
         };
 
         match estimated {
@@ -331,7 +391,7 @@ impl TollBoothEngine {
                 match self
                     .config
                     .storage
-                    .adjust_credits(payment_hash, delta, est.currency)
+                    .adjust_credits(&est.payment_hash, delta, est.currency)
                 {
                     Ok(new_balance) => ReconcileResult {
                         adjusted: true,
@@ -352,7 +412,13 @@ impl TollBoothEngine {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn track_estimated_cost(&self, payment_hash: &str, cost: u64, currency: Currency) {
+    fn track_estimated_cost(
+        &self,
+        request_id: &str,
+        payment_hash: &str,
+        cost: u64,
+        currency: Currency,
+    ) {
         let mut map = match self.estimated_costs.lock() {
             Ok(m) => m,
             Err(_) => return, // poisoned mutex -- skip tracking rather than panic
@@ -365,8 +431,9 @@ impl TollBoothEngine {
         }
 
         map.insert(
-            payment_hash.to_string(),
+            request_id.to_string(),
             EstimatedCost {
+                payment_hash: payment_hash.to_string(),
                 cost,
                 currency,
                 timestamp: Instant::now(),
@@ -448,6 +515,24 @@ impl TollBoothEngine {
     }
 }
 
+/// Build a 500-style blocked outcome for payment-infrastructure failures
+/// (storage or rail errors). Deliberately distinct from auth failures, which
+/// fall through to the 402 challenge: during an outage we fail closed rather
+/// than granting free-tier access.
+fn infrastructure_error() -> TollBoothResult {
+    TollBoothResult::Blocked {
+        status: 500,
+        body: serde_json::json!({"error": "payment infrastructure unavailable"}),
+    }
+}
+
+/// Generate a unique per-request identifier for cost-reconciliation tracking.
+fn generate_request_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// Capitalise a header segment: "app_id" -> "App-Id"
 fn capitalise_header(key: &str) -> String {
     key.split('_')
@@ -473,13 +558,16 @@ fn capitalise_header(key: &str) -> String {
 mod tests {
     use super::*;
     use crate::macaroon;
-    use crate::rails::{L402Rail, L402RailConfig};
+    use crate::rails::{L402Rail, L402RailConfig, RailVerifyResult};
     use crate::storage::MemoryStorage;
-    use crate::types::Currency;
+    use crate::types::{Currency, RailError};
     use sha2::{Digest, Sha256};
 
-    fn test_root_key() -> String {
-        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()
+    fn test_root_key() -> RootKey {
+        RootKey::from_hex(
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        )
+        .unwrap()
     }
 
     fn make_engine(free_requests: Option<u64>) -> TollBoothEngine {
@@ -497,7 +585,7 @@ mod tests {
             storage,
             pricing,
             upstream: "http://localhost:8080".into(),
-            root_key: test_root_key(),
+            root_key: Some(test_root_key()),
             rails: vec![Box::new(l402)],
             free_tier: free_requests.map(FreeTierConfig::Requests),
             ..Default::default()
@@ -680,18 +768,20 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile() {
         let engine = make_engine(None);
-        let (auth_header, payment_hash, _) = make_l402_auth_header(1000);
+        let (auth_header, _payment_hash, _) = make_l402_auth_header(1000);
 
         // Authenticate and debit 100 (route cost)
         let req = make_request("GET", "/api/test", Some(&auth_header));
         let result = engine.handle(&req).await;
-        assert!(
-            matches!(result, TollBoothResult::Proxy { .. }),
-            "should proxy with valid auth"
-        );
+        let request_id = match result {
+            TollBoothResult::Proxy { request_id, .. } => {
+                request_id.expect("paid proxy must return a request_id")
+            }
+            other => panic!("should proxy with valid auth, got {:?}", other),
+        };
 
         // Reconcile: actual cost was 50, we charged 100, so refund 50
-        let reconcile_result = engine.reconcile(&payment_hash, 50);
+        let reconcile_result = engine.reconcile(&request_id, 50);
         assert!(reconcile_result.adjusted, "should adjust");
         assert_eq!(
             reconcile_result.delta, 50,
@@ -810,6 +900,256 @@ mod tests {
         assert_eq!(capitalise_header("my_long_key"), "My-Long-Key");
     }
 
+    // -- Security: reconcile is one-shot (no double refund) --
+
+    #[tokio::test]
+    async fn test_reconcile_is_one_shot() {
+        let engine = make_engine(None);
+        let (auth_header, _, _) = make_l402_auth_header(1000);
+
+        let req = make_request("GET", "/api/test", Some(&auth_header));
+        let request_id = match engine.handle(&req).await {
+            TollBoothResult::Proxy { request_id, .. } => request_id.unwrap(),
+            other => panic!("expected Proxy, got {:?}", other),
+        };
+
+        // First reconcile refunds the overcharge (100 estimated, 50 actual).
+        let first = engine.reconcile(&request_id, 50);
+        assert!(first.adjusted, "first reconcile should refund");
+        assert_eq!(first.delta, 50);
+
+        // Second reconcile of the same request must not refund again.
+        let second = engine.reconcile(&request_id, 50);
+        assert!(!second.adjusted, "second reconcile must be a no-op");
+        assert_eq!(second.delta, 0);
+    }
+
+    // -- Security: concurrent requests on one credit account keep separate estimates --
+
+    #[tokio::test]
+    async fn test_reconcile_concurrent_requests_same_account() {
+        let engine = make_engine(None);
+        let (auth_header, _, _) = make_l402_auth_header(1000);
+        let req = make_request("GET", "/api/test", Some(&auth_header));
+
+        let id1 = match engine.handle(&req).await {
+            TollBoothResult::Proxy { request_id, .. } => request_id.unwrap(),
+            other => panic!("expected Proxy, got {:?}", other),
+        };
+        let id2 = match engine.handle(&req).await {
+            TollBoothResult::Proxy { request_id, .. } => request_id.unwrap(),
+            other => panic!("expected Proxy, got {:?}", other),
+        };
+        assert_ne!(id1, id2, "each request must get a unique request_id");
+
+        // Both requests reconcile independently; neither overwrites the other.
+        let r1 = engine.reconcile(&id1, 60); // estimated 100, actual 60 -> refund 40
+        let r2 = engine.reconcile(&id2, 70); // estimated 100, actual 70 -> refund 30
+        assert!(r1.adjusted, "first request reconcile should refund");
+        assert!(r2.adjusted, "second request reconcile should refund");
+        assert_eq!(r1.delta, 40);
+        assert_eq!(r2.delta, 30);
+        // 1000 - 100 - 100 + 40 + 30 = 870
+        assert_eq!(r2.new_balance, 870);
+    }
+
+    // -- Security: storage outage fails closed (no free-tier fallthrough) --
+
+    fn make_engine_with_storage(
+        storage: Arc<dyn StorageBackend>,
+        free_requests: Option<u64>,
+    ) -> TollBoothEngine {
+        let l402 = L402Rail::new(L402RailConfig {
+            root_key: test_root_key(),
+            storage: storage.clone(),
+            default_amount: 100,
+            backend: None,
+            service_name: None,
+        });
+        let mut pricing = HashMap::new();
+        pricing.insert("/api/test".to_string(), PricingEntry::Simple(100));
+        TollBoothEngine::new(TollBoothConfig {
+            storage,
+            pricing,
+            upstream: "http://localhost:8080".into(),
+            root_key: Some(test_root_key()),
+            rails: vec![Box::new(l402)],
+            free_tier: free_requests.map(FreeTierConfig::Requests),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_debit_storage_error_blocks_500() {
+        use crate::storage::memory::test_util::FlakyStorage;
+
+        // Free tier enabled to prove the failure does NOT fall through to it.
+        let storage: Arc<dyn StorageBackend> = Arc::new(FlakyStorage::new(true, false));
+        let engine = make_engine_with_storage(storage, Some(100));
+
+        let (auth_header, _, _) = make_l402_auth_header(1000);
+        let req = make_request("GET", "/api/test", Some(&auth_header));
+        match engine.handle(&req).await {
+            TollBoothResult::Blocked { status, .. } => {
+                assert_eq!(status, 500, "debit outage must block with 500");
+            }
+            other => panic!("expected Blocked(500) on storage outage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_settle_storage_error_blocks_500() {
+        use crate::storage::memory::test_util::FlakyStorage;
+
+        struct PerRequestRail;
+
+        #[async_trait::async_trait]
+        impl PaymentRail for PerRequestRail {
+            fn rail_type(&self) -> &str {
+                "per-request"
+            }
+            fn credit_supported(&self) -> bool {
+                false
+            }
+            fn detect(&self, _req: &TollBoothRequest) -> bool {
+                true
+            }
+            async fn challenge(
+                &self,
+                _route: &str,
+                _price: &PriceInfo,
+            ) -> Result<crate::rails::ChallengeFragment, RailError> {
+                Err(RailError::Challenge("unavailable".into()))
+            }
+            async fn verify(
+                &self,
+                _req: &TollBoothRequest,
+            ) -> Result<RailVerifyResult, RailError> {
+                Ok(RailVerifyResult {
+                    authenticated: true,
+                    payment_id: "test-payment".to_string(),
+                    mode: PaymentMode::PerRequest,
+                    credit_balance: None,
+                    currency: Currency::Sat,
+                    custom_caveats: HashMap::new(),
+                })
+            }
+        }
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(FlakyStorage::new(false, true));
+        let mut pricing = HashMap::new();
+        pricing.insert("/api/test".to_string(), PricingEntry::Simple(100));
+        let engine = TollBoothEngine::new(TollBoothConfig {
+            storage,
+            pricing,
+            upstream: "http://localhost:8080".into(),
+            rails: vec![Box::new(PerRequestRail)],
+            free_tier: Some(FreeTierConfig::Requests(100)),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let req = make_request("GET", "/api/test", None);
+        match engine.handle(&req).await {
+            TollBoothResult::Blocked { status, .. } => {
+                assert_eq!(status, 500, "settle outage must block with 500");
+            }
+            other => panic!("expected Blocked(500) on settle outage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rail_verify_error_blocks_500() {
+        struct FailingRail;
+
+        #[async_trait::async_trait]
+        impl PaymentRail for FailingRail {
+            fn rail_type(&self) -> &str {
+                "failing"
+            }
+            fn credit_supported(&self) -> bool {
+                false
+            }
+            fn detect(&self, _req: &TollBoothRequest) -> bool {
+                true
+            }
+            async fn challenge(
+                &self,
+                _route: &str,
+                _price: &PriceInfo,
+            ) -> Result<crate::rails::ChallengeFragment, RailError> {
+                Err(RailError::Challenge("unavailable".into()))
+            }
+            async fn verify(
+                &self,
+                _req: &TollBoothRequest,
+            ) -> Result<RailVerifyResult, RailError> {
+                Err(RailError::Verification("backend down".into()))
+            }
+        }
+
+        let mut pricing = HashMap::new();
+        pricing.insert("/api/test".to_string(), PricingEntry::Simple(100));
+        let engine = TollBoothEngine::new(TollBoothConfig {
+            pricing,
+            upstream: "http://localhost:8080".into(),
+            rails: vec![Box::new(FailingRail)],
+            free_tier: Some(FreeTierConfig::Requests(100)),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let req = make_request("GET", "/api/test", None);
+        match engine.handle(&req).await {
+            TollBoothResult::Blocked { status, .. } => {
+                assert_eq!(status, 500, "rail verify outage must block with 500");
+            }
+            other => panic!("expected Blocked(500) on rail error, got {:?}", other),
+        }
+    }
+
+    // -- Security: tiered pricing without a "default" tier is rejected --
+
+    #[test]
+    fn test_tiered_pricing_without_default_rejected() {
+        let mut tiers = HashMap::new();
+        tiers.insert("cheap".to_string(), 10u64);
+        let mut pricing = HashMap::new();
+        pricing.insert("/api/test".to_string(), PricingEntry::Tiered(tiers));
+
+        let result = TollBoothEngine::new(TollBoothConfig {
+            pricing,
+            upstream: "http://localhost:8080".into(),
+            ..Default::default()
+        });
+        match result {
+            Err(TollBoothError::Config(msg)) => {
+                assert!(
+                    msg.contains("default"),
+                    "error should mention the missing default tier: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {:?}", other.is_ok()),
+        }
+    }
+
+    // -- Security: free tier fails closed when no trustworthy IP exists --
+
+    #[tokio::test]
+    async fn test_free_tier_not_granted_for_unknown_ip() {
+        let engine = make_engine(Some(10));
+        let mut req = make_request("GET", "/api/test", None);
+        req.ip = UNKNOWN_IP.to_string();
+
+        let result = engine.handle(&req).await;
+        assert!(
+            matches!(result, TollBoothResult::Challenge { .. }),
+            "unknown IP must fail closed to a challenge, got {:?}",
+            result
+        );
+    }
+
     // -----------------------------------------------------------------------
     // End-to-end: full 402 → pay → access flow
     // -----------------------------------------------------------------------
@@ -842,7 +1182,7 @@ mod tests {
             storage,
             pricing,
             upstream: "http://localhost:8080".into(),
-            root_key: test_root_key(),
+            root_key: Some(test_root_key()),
             rails: vec![Box::new(l402)],
             free_tier: None,
             ..Default::default()

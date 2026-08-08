@@ -6,8 +6,49 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::types::{Currency, MacaroonError};
+
+// ---------------------------------------------------------------------------
+// RootKey
+// ---------------------------------------------------------------------------
+
+/// Macaroon root key, decoded once from hex at construction.
+///
+/// The key material is wrapped in [`Zeroizing`] so it is scrubbed from memory
+/// on drop, and its `Debug` implementation redacts the key bytes so secrets
+/// cannot leak through logs or error messages.
+pub struct RootKey {
+    bytes: Zeroizing<[u8; 32]>,
+}
+
+impl RootKey {
+    /// Decode a 64-character hex string into a `RootKey`.
+    pub fn from_hex(hex_str: &str) -> Result<Self, MacaroonError> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(hex_str, &mut bytes[..]).map_err(|_| MacaroonError::InvalidRootKey)?;
+        Ok(RootKey { bytes })
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+}
+
+impl Clone for RootKey {
+    fn clone(&self) -> Self {
+        RootKey {
+            bytes: Zeroizing::new(*self.bytes),
+        }
+    }
+}
+
+impl std::fmt::Debug for RootKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RootKey([REDACTED])")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -389,18 +430,12 @@ pub struct VerifyResult {
 /// Custom caveats must not use reserved keys.
 /// Returns a URL-safe base64-encoded V2 macaroon.
 pub fn mint_macaroon(
-    root_key_hex: &str,
+    root_key: &RootKey,
     payment_hash: &str,
     credit_balance: i64,
     custom_caveats: &[String],
     currency: Currency,
 ) -> Result<String, MacaroonError> {
-    // Validate root key
-    let root_key = hex::decode(root_key_hex).map_err(|_| MacaroonError::InvalidRootKey)?;
-    if root_key.len() != 32 {
-        return Err(MacaroonError::InvalidRootKey);
-    }
-
     // Reject reserved keys in custom caveats
     for caveat in custom_caveats {
         if let Some((key, _)) = parse_caveat(caveat) {
@@ -418,7 +453,7 @@ pub fn mint_macaroon(
     let id = encode_l402_identifier(payment_hash)?;
 
     // Create macaroon and add mandatory caveats
-    let mut mac = Macaroon::create(&root_key, &id);
+    let mut mac = Macaroon::create(root_key.as_bytes(), &id);
     mac.add_first_party_caveat(&format!("payment_hash = {payment_hash}"));
     mac.add_first_party_caveat(&format!("credit_balance = {credit_balance}"));
     mac.add_first_party_caveat(&format!("currency = {}", currency_to_str(currency)));
@@ -439,7 +474,7 @@ pub fn mint_macaroon(
 /// verification failures (wrong key, expired, route mismatch, etc.).
 /// Returns `Err` only for structural decoding problems.
 pub fn verify_macaroon(
-    root_key_hex: &str,
+    root_key: &RootKey,
     macaroon_b64: &str,
     context: Option<&VerifyContext>,
 ) -> Result<VerifyResult, MacaroonError> {
@@ -451,16 +486,13 @@ pub fn verify_macaroon(
         custom_caveats: HashMap::new(),
     };
 
-    // Decode root key
-    let root_key = hex::decode(root_key_hex).map_err(|_| MacaroonError::InvalidRootKey)?;
-
     // Decode base64 -> binary -> parse V2
     let binary =
         base64_url_decode(macaroon_b64).map_err(|e| MacaroonError::Encoding(e.to_string()))?;
     let mac = Macaroon::deserialise_v2(&binary)?;
 
     // Verify HMAC signature
-    let expected = mac.compute_expected_signature(&root_key);
+    let expected = mac.compute_expected_signature(root_key.as_bytes());
     if expected.ct_eq(&mac.signature).unwrap_u8() != 1 {
         return Ok(invalid(Currency::default()));
     }
@@ -605,6 +637,33 @@ mod tests {
     const TEST_PAYMENT_HASH: &str =
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
+    fn root_key() -> RootKey {
+        RootKey::from_hex(TEST_ROOT_KEY).unwrap()
+    }
+
+    // -- Security: root key hygiene --
+
+    #[test]
+    fn root_key_from_hex_rejects_invalid_input() {
+        // Not hex
+        assert!(RootKey::from_hex("zzzz").is_err());
+        // Valid hex but wrong length (16 bytes)
+        assert!(RootKey::from_hex("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4").is_err());
+        // Empty
+        assert!(RootKey::from_hex("").is_err());
+    }
+
+    #[test]
+    fn root_key_debug_redacts_key_material() {
+        let key = root_key();
+        let debug = format!("{:?}", key);
+        assert!(
+            !debug.contains(TEST_ROOT_KEY),
+            "Debug output must not contain key material, got: {debug}"
+        );
+        assert!(debug.contains("REDACTED"));
+    }
+
     #[test]
     fn derive_key_is_deterministic_and_different_from_input() {
         let key_bytes = hex::decode(TEST_ROOT_KEY).unwrap();
@@ -643,9 +702,9 @@ mod tests {
     #[test]
     fn mint_and_verify_roundtrip() {
         let mac_b64 =
-            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
+            mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
 
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, None).unwrap();
         assert!(result.valid);
         assert_eq!(result.payment_hash.as_deref(), Some(TEST_PAYMENT_HASH));
         assert_eq!(result.credit_balance, Some(1000));
@@ -659,7 +718,7 @@ mod tests {
             "tier = premium".to_string(),
         ];
         let mac_b64 = mint_macaroon(
-            TEST_ROOT_KEY,
+            &root_key(),
             TEST_PAYMENT_HASH,
             500,
             &caveats,
@@ -667,7 +726,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, None).unwrap();
         assert!(result.valid);
         assert_eq!(
             result.custom_caveats.get("app_id").map(|s| s.as_str()),
@@ -682,10 +741,13 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_root_key() {
         let mac_b64 =
-            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
+            mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
 
-        let wrong_key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let result = verify_macaroon(wrong_key, &mac_b64, None).unwrap();
+        let wrong_key = RootKey::from_hex(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+        let result = verify_macaroon(&wrong_key, &mac_b64, None).unwrap();
         assert!(!result.valid);
     }
 
@@ -693,7 +755,7 @@ mod tests {
     fn verify_rejects_duplicate_caveats() {
         // Attempt to mint with a reserved key -- should be rejected at mint time.
         let result = mint_macaroon(
-            TEST_ROOT_KEY,
+            &root_key(),
             TEST_PAYMENT_HASH,
             1000,
             &["payment_hash = evil".to_string()],
@@ -715,7 +777,7 @@ mod tests {
 
         let binary = mac.serialise_v2();
         let mac_b64 = base64_url_encode(&binary);
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, None).unwrap();
         assert!(!result.valid, "duplicate caveat key must cause rejection");
     }
 
@@ -739,7 +801,7 @@ mod tests {
             ip: None,
             now: None,
         };
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, Some(&ctx_match)).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, Some(&ctx_match)).unwrap();
         assert!(result.valid);
 
         let ctx_no_match = VerifyContext {
@@ -747,7 +809,7 @@ mod tests {
             ip: None,
             now: None,
         };
-        let result2 = verify_macaroon(TEST_ROOT_KEY, &mac_b64, Some(&ctx_no_match)).unwrap();
+        let result2 = verify_macaroon(&root_key(), &mac_b64, Some(&ctx_no_match)).unwrap();
         assert!(!result2.valid);
     }
 
@@ -794,7 +856,7 @@ mod tests {
         ] {
             let caveat = format!("{reserved} = test");
             let result = mint_macaroon(
-                TEST_ROOT_KEY,
+                &root_key(),
                 TEST_PAYMENT_HASH,
                 1000,
                 &[caveat],
@@ -807,9 +869,9 @@ mod tests {
     #[test]
     fn usd_currency_support() {
         let mac_b64 =
-            mint_macaroon(TEST_ROOT_KEY, TEST_PAYMENT_HASH, 2500, &[], Currency::Usd).unwrap();
+            mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 2500, &[], Currency::Usd).unwrap();
 
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, None).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, None).unwrap();
         assert!(result.valid);
         assert_eq!(result.credit_balance, Some(2500));
         assert_eq!(result.currency, Currency::Usd);
@@ -830,7 +892,7 @@ mod tests {
     fn parse_macaroon_caveats_returns_all_caveats() {
         let caveats = vec!["app_id = test123".to_string()];
         let mac_b64 = mint_macaroon(
-            TEST_ROOT_KEY,
+            &root_key(),
             TEST_PAYMENT_HASH,
             750,
             &caveats,
@@ -874,7 +936,7 @@ mod tests {
             ip: None,
             now: Some(Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap()),
         };
-        let result = verify_macaroon(TEST_ROOT_KEY, &mac_b64, Some(&ctx_before)).unwrap();
+        let result = verify_macaroon(&root_key(), &mac_b64, Some(&ctx_before)).unwrap();
         assert!(result.valid, "should be valid before expiry");
 
         // After expiry -- should fail
@@ -883,7 +945,7 @@ mod tests {
             ip: None,
             now: Some(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
         };
-        let result2 = verify_macaroon(TEST_ROOT_KEY, &mac_b64, Some(&ctx_after)).unwrap();
+        let result2 = verify_macaroon(&root_key(), &mac_b64, Some(&ctx_after)).unwrap();
         assert!(!result2.valid, "should be invalid after expiry");
     }
 

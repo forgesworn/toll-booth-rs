@@ -69,6 +69,17 @@ struct EstimatedCost {
 const MAX_ESTIMATED_ENTRIES: usize = 10_000;
 const ESTIMATED_TTL: Duration = Duration::from_secs(60);
 
+/// Maximum unpaid invoices one client IP may have outstanding. Challenges
+/// are unauthenticated, so without this an attacker could mint invoices in a
+/// tight loop. When the cap is hit the challenge is still returned but its
+/// invoice metadata is not persisted.
+const MAX_PENDING_INVOICES_PER_IP: u64 = 100;
+
+/// Invoices older than this are pruned opportunistically when new challenges
+/// are issued, bounding storage growth for the common case where no operator
+/// pruning task is configured.
+const INVOICE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 // ---------------------------------------------------------------------------
 // TollBoothEngine
 // ---------------------------------------------------------------------------
@@ -132,17 +143,13 @@ impl TollBoothEngine {
                 Some(tier) => {
                     if !is_valid_tier(tier) {
                         // Invalid tier key format -- return 402 challenge
-                        return self
-                            .build_challenge(&req.path, &pricing_entry.normalise())
-                            .await;
+                        return self.build_challenge(req, &pricing_entry.normalise()).await;
                     }
                     match pricing_entry.tier_price(tier) {
                         Some(p) => p,
                         None => {
                             // Tier not found -- return 402 challenge
-                            return self
-                                .build_challenge(&req.path, &pricing_entry.normalise())
-                                .await;
+                            return self.build_challenge(req, &pricing_entry.normalise()).await;
                         }
                     }
                 }
@@ -280,12 +287,7 @@ impl TollBoothEngine {
                         }
 
                         let request_id = generate_request_id();
-                        self.track_estimated_cost(
-                            &request_id,
-                            &payment_hash,
-                            route_cost,
-                            currency,
-                        );
+                        self.track_estimated_cost(&request_id, &payment_hash, route_cost, currency);
 
                         let mut headers = HashMap::new();
                         if let Some(ref tier) = req.tier {
@@ -344,7 +346,7 @@ impl TollBoothEngine {
         }
 
         // 6. Generate challenges from all rails
-        self.build_challenge(&req.path, &price).await
+        self.build_challenge(req, &price).await
     }
 
     /// Reconcile estimated vs actual cost after the upstream responds.
@@ -441,7 +443,8 @@ impl TollBoothEngine {
         );
     }
 
-    async fn build_challenge(&self, route: &str, price: &PriceInfo) -> TollBoothResult {
+    async fn build_challenge(&self, req: &TollBoothRequest, price: &PriceInfo) -> TollBoothResult {
+        let route = &req.path;
         let mut all_www_auth: Vec<String> = Vec::new();
         let mut body = serde_json::Map::new();
 
@@ -484,21 +487,45 @@ impl TollBoothEngine {
                 .unwrap_or(0);
 
             if !payment_hash.is_empty() {
-                let mut status_token_bytes = [0u8; 16];
-                rand::thread_rng().fill_bytes(&mut status_token_bytes);
-                let status_token = hex::encode(status_token_bytes);
+                // Opportunistically drop expired invoices so the store does
+                // not grow without bound when no pruning task is configured.
+                let _ = self.config.storage.prune_expired_invoices(INVOICE_TTL);
 
-                let invoice = StoredInvoice {
-                    payment_hash: payment_hash.to_string(),
-                    bolt11: bolt11.to_string(),
-                    amount_sats,
-                    macaroon: macaroon.to_string(),
-                    status_token,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    client_ip: None,
+                // Rate-limit outstanding invoices per client IP. UNKNOWN_IP
+                // is not attributable, so it is exempt here; the storage
+                // backend's global capacity cap still bounds memory.
+                let client_ip = if req.ip != UNKNOWN_IP {
+                    Some(req.ip.clone())
+                } else {
+                    None
+                };
+                let under_cap = match &client_ip {
+                    Some(ip) => self
+                        .config
+                        .storage
+                        .pending_invoice_count(ip)
+                        .map(|n| n < MAX_PENDING_INVOICES_PER_IP)
+                        .unwrap_or(false),
+                    None => true,
                 };
 
-                let _ = self.config.storage.store_invoice(&invoice);
+                if under_cap {
+                    let mut status_token_bytes = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut status_token_bytes);
+                    let status_token = hex::encode(status_token_bytes);
+
+                    let invoice = StoredInvoice {
+                        payment_hash: payment_hash.to_string(),
+                        bolt11: bolt11.to_string(),
+                        amount_sats,
+                        macaroon: macaroon.to_string(),
+                        status_token,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        client_ip,
+                    };
+
+                    let _ = self.config.storage.store_invoice(&invoice);
+                }
             }
         }
 
@@ -564,10 +591,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn test_root_key() -> RootKey {
-        RootKey::from_hex(
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        )
-        .unwrap()
+        RootKey::from_hex("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+            .unwrap()
     }
 
     fn make_engine(free_requests: Option<u64>) -> TollBoothEngine {
@@ -1022,10 +1047,7 @@ mod tests {
             ) -> Result<crate::rails::ChallengeFragment, RailError> {
                 Err(RailError::Challenge("unavailable".into()))
             }
-            async fn verify(
-                &self,
-                _req: &TollBoothRequest,
-            ) -> Result<RailVerifyResult, RailError> {
+            async fn verify(&self, _req: &TollBoothRequest) -> Result<RailVerifyResult, RailError> {
                 Ok(RailVerifyResult {
                     authenticated: true,
                     payment_id: "test-payment".to_string(),
@@ -1081,10 +1103,7 @@ mod tests {
             ) -> Result<crate::rails::ChallengeFragment, RailError> {
                 Err(RailError::Challenge("unavailable".into()))
             }
-            async fn verify(
-                &self,
-                _req: &TollBoothRequest,
-            ) -> Result<RailVerifyResult, RailError> {
+            async fn verify(&self, _req: &TollBoothRequest) -> Result<RailVerifyResult, RailError> {
                 Err(RailError::Verification("backend down".into()))
             }
         }
@@ -1346,6 +1365,63 @@ mod tests {
         assert!(
             result.delta <= 0,
             "delta must not be positive when actual_cost is huge"
+        );
+    }
+
+    // -- Security: unauthenticated challenge flood cannot grow invoice storage --
+
+    fn engine_and_storage() -> (TollBoothEngine, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage::new());
+        let engine = make_engine_with_storage(storage.clone(), None);
+        (engine, storage)
+    }
+
+    #[tokio::test]
+    async fn test_challenge_stores_client_ip() {
+        let (engine, storage) = engine_and_storage();
+        let req = make_request("GET", "/api/test", None);
+        let result = engine.handle(&req).await;
+        assert!(matches!(result, TollBoothResult::Challenge { .. }));
+
+        assert_eq!(
+            storage.pending_invoice_count("127.0.0.1").unwrap(),
+            1,
+            "challenge must record the client IP so per-IP limits can bite"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_invoice_per_ip_cap() {
+        let (engine, storage) = engine_and_storage();
+        let req = make_request("GET", "/api/test", None);
+
+        for _ in 0..(MAX_PENDING_INVOICES_PER_IP + 10) {
+            let result = engine.handle(&req).await;
+            assert!(
+                matches!(result, TollBoothResult::Challenge { .. }),
+                "challenges must still be served when over the invoice cap"
+            );
+        }
+
+        assert_eq!(
+            storage.pending_invoice_count("127.0.0.1").unwrap(),
+            MAX_PENDING_INVOICES_PER_IP,
+            "per-IP pending invoice count must be capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_ip_invoice_not_attributed() {
+        let (engine, storage) = engine_and_storage();
+        let mut req = make_request("GET", "/api/test", None);
+        req.ip = UNKNOWN_IP.to_string();
+        let result = engine.handle(&req).await;
+        assert!(matches!(result, TollBoothResult::Challenge { .. }));
+
+        assert_eq!(
+            storage.pending_invoice_count(UNKNOWN_IP).unwrap(),
+            0,
+            "UNKNOWN_IP must not be stored as an attributable client"
         );
     }
 }

@@ -182,8 +182,8 @@ where
                 // Blocked — short-circuit with the engine-supplied status
                 // -------------------------------------------------------
                 TollBoothResult::Blocked { status, body } => {
-                    let status_code = http::StatusCode::from_u16(status)
-                        .unwrap_or(http::StatusCode::FORBIDDEN);
+                    let status_code =
+                        http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::FORBIDDEN);
                     let mut response = axum::Json(body).into_response();
                     *response.status_mut() = status_code;
                     Ok(response)
@@ -226,11 +226,36 @@ fn extract_request(
             let peer_ip = peer_addr.ip();
             let peer_is_trusted = trusted_proxies.iter().any(|net| net.contains(&peer_ip));
             if peer_is_trusted {
+                // Walk X-Forwarded-For right-to-left, skipping hops that are
+                // themselves trusted proxies. The right-most entry is the
+                // client address observed by our directly-connected trusted
+                // proxy; the left-most entry is the most easily spoofed
+                // (proxies commonly *append* to a client-supplied XFF), so
+                // trusting it would let clients rotate fake IPs to evade
+                // free-tier quotas and `ip` caveats.
+                let is_trusted = |ip: &str| {
+                    ip.parse::<std::net::IpAddr>()
+                        .map(|addr| trusted_proxies.iter().any(|net| net.contains(&addr)))
+                        .unwrap_or(false)
+                };
                 headers
                     .get("x-forwarded-for")
-                    .and_then(|v| v.split(',').next())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .and_then(|v| {
+                        let entries: Vec<&str> = v
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        // First untrusted entry from the right; if every hop
+                        // is trusted, fall back to the left-most entry.
+                        entries
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|ip| !is_trusted(ip))
+                            .or_else(|| entries.first().copied())
+                    })
+                    .map(|s| s.to_string())
                     .or_else(|| headers.get("x-real-ip").cloned())
                     .unwrap_or_else(|| peer_ip.to_string())
             } else {
@@ -277,10 +302,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn test_root_key() -> RootKey {
-        RootKey::from_hex(
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        )
-        .unwrap()
+        RootKey::from_hex("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+            .unwrap()
     }
 
     fn make_engine() -> TollBoothEngine {
@@ -420,8 +443,7 @@ mod tests {
 
     fn app_with_free_tier(n: u64, trusted: Vec<IpNet>) -> Router {
         build_app_with_layer(
-            TollBoothLayer::new(make_engine_with_free_tier(Some(n)))
-                .with_trusted_proxies(trusted),
+            TollBoothLayer::new(make_engine_with_free_tier(Some(n))).with_trusted_proxies(trusted),
         )
     }
 
@@ -514,6 +536,80 @@ mod tests {
         );
         let r3 = app.oneshot(req3).await.unwrap();
         assert_eq!(r3.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_xff_spoofed_leftmost_does_not_evade_quota() {
+        // nginx-style appending proxy: the client prepends a fake XFF entry
+        // and the proxy appends the real client IP ("spoofed, real"). The
+        // middleware must trust the right-most untrusted entry, so rotating
+        // the spoofed left-most entry cannot reset the free-tier quota.
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let app = app_with_free_tier(1, trusted);
+
+        let req1 = with_connect_info(
+            Request::builder()
+                .uri("/api/test")
+                .header("x-forwarded-for", "198.51.100.99, 203.0.113.1")
+                .body(Body::empty())
+                .unwrap(),
+            [10, 0, 0, 1],
+        );
+        let r1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // Same real client, different spoofed left-most entry: must NOT
+        // grant another free request.
+        let req2 = with_connect_info(
+            Request::builder()
+                .uri("/api/test")
+                .header("x-forwarded-for", "198.51.100.100, 203.0.113.1")
+                .body(Body::empty())
+                .unwrap(),
+            [10, 0, 0, 1],
+        );
+        let r2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "spoofed left-most XFF must not evade the real client's quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xff_multi_hop_skips_trusted_proxies() {
+        // Chain: client -> trusted edge proxy (10.0.0.2) -> trusted inner
+        // proxy (10.0.0.1, the direct peer). The client IP is the first
+        // untrusted entry walking right-to-left.
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let app = app_with_free_tier(1, trusted);
+
+        let req1 = with_connect_info(
+            Request::builder()
+                .uri("/api/test")
+                .header("x-forwarded-for", "203.0.113.1, 10.0.0.2")
+                .body(Body::empty())
+                .unwrap(),
+            [10, 0, 0, 1],
+        );
+        let r1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // Same chain and client: quota must be tracked on 203.0.113.1.
+        let req2 = with_connect_info(
+            Request::builder()
+                .uri("/api/test")
+                .header("x-forwarded-for", "203.0.113.1, 10.0.0.2")
+                .body(Body::empty())
+                .unwrap(),
+            [10, 0, 0, 1],
+        );
+        let r2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "multi-hop chain must resolve quota to the real client IP"
+        );
     }
 
     #[tokio::test]

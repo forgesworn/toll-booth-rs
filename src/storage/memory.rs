@@ -1,14 +1,31 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use super::traits::StorageBackend;
 use crate::types::{Currency, DebitResult, StorageError, StoredInvoice};
 
-#[derive(Debug, Default)]
+/// Hard bound on stored invoices. Challenges are unauthenticated, so without
+/// a cap an attacker could grow this map until the host runs out of memory.
+/// When the cap is reached the oldest entries are evicted (FIFO).
+const MAX_STORED_INVOICES: usize = 100_000;
+
+#[derive(Debug)]
 struct BalanceRecord {
     sat: i64,
     usd: i64,
+    updated_at: Instant,
+}
+
+impl Default for BalanceRecord {
+    fn default() -> Self {
+        BalanceRecord {
+            sat: 0,
+            usd: 0,
+            updated_at: Instant::now(),
+        }
+    }
 }
 
 impl BalanceRecord {
@@ -24,9 +41,12 @@ impl BalanceRecord {
             Currency::Sat => self.sat = value,
             Currency::Usd => self.usd = value,
         }
+        self.updated_at = Instant::now();
     }
 }
 
+// No timestamp here: settlement records are the replay guard for
+// settle_with_credit and must never be pruned.
 #[derive(Debug, Default)]
 struct SettlementRecord {
     settled: bool,
@@ -38,6 +58,24 @@ struct Inner {
     balances: HashMap<String, BalanceRecord>,
     settlements: HashMap<String, SettlementRecord>,
     invoices: HashMap<String, StoredInvoice>,
+    /// Insertion order of invoice payment hashes, for FIFO eviction at the
+    /// capacity cap. May contain keys already pruned from `invoices`; those
+    /// are skipped on eviction.
+    invoice_order: VecDeque<String>,
+}
+
+impl Inner {
+    /// Evict oldest invoices until below [`MAX_STORED_INVOICES`].
+    fn enforce_invoice_cap(&mut self) {
+        while self.invoices.len() >= MAX_STORED_INVOICES {
+            match self.invoice_order.pop_front() {
+                Some(oldest) => {
+                    self.invoices.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +240,11 @@ impl StorageBackend for MemoryStorage {
             .inner
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
+        let is_new = !inner.invoices.contains_key(&invoice.payment_hash);
+        if is_new {
+            inner.enforce_invoice_cap();
+            inner.invoice_order.push_back(invoice.payment_hash.clone());
+        }
         inner
             .invoices
             .insert(invoice.payment_hash.clone(), invoice.clone());
@@ -253,12 +296,38 @@ impl StorageBackend for MemoryStorage {
         Ok(count as u64)
     }
 
-    fn prune_expired_invoices(&self, _max_age: std::time::Duration) -> Result<u64, StorageError> {
-        Ok(0)
+    fn prune_expired_invoices(&self, max_age: Duration) -> Result<u64, StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let cutoff = chrono::Utc::now() - max_age;
+        let before = inner.invoices.len();
+        // Entries with an unparseable timestamp can never be aged; drop them
+        // rather than letting them occupy capacity forever.
+        inner.invoices.retain(|_, inv| {
+            chrono::DateTime::parse_from_rfc3339(&inv.created_at)
+                .map(|created| created > cutoff)
+                .unwrap_or(false)
+        });
+        Ok((before - inner.invoices.len()) as u64)
     }
 
-    fn prune_stale_records(&self, _max_age: std::time::Duration) -> Result<u64, StorageError> {
-        Ok(0)
+    fn prune_stale_records(&self, max_age: Duration) -> Result<u64, StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let now = Instant::now();
+        let before = inner.balances.len();
+        // Only fully-drained balance records are safe to drop: removing a
+        // record with a remaining balance would destroy funds, and removing
+        // settlement records is never safe because they are the replay guard
+        // for settle_with_credit.
+        inner.balances.retain(|_, rec| {
+            rec.sat != 0 || rec.usd != 0 || now.duration_since(rec.updated_at) < max_age
+        });
+        Ok((before - inner.balances.len()) as u64)
     }
 }
 
@@ -461,6 +530,119 @@ mod tests {
             "settle_with_credit must reject i64 overflow"
         );
     }
+
+    // -- Security: invoice pruning and capacity bounds (unauthenticated DoS) --
+
+    #[test]
+    fn prune_expired_invoices_removes_old_keeps_recent() {
+        let store = MemoryStorage::new();
+        let old_h = hash(30);
+        let new_h = hash(31);
+
+        let mut old_inv = make_invoice(&old_h, "tok_old", Some("1.2.3.4"));
+        old_inv.created_at = "2020-01-01T00:00:00+00:00".to_string();
+        let mut new_inv = make_invoice(&new_h, "tok_new", Some("1.2.3.4"));
+        new_inv.created_at = chrono::Utc::now().to_rfc3339();
+
+        store.store_invoice(&old_inv).unwrap();
+        store.store_invoice(&new_inv).unwrap();
+
+        let removed = store
+            .prune_expired_invoices(std::time::Duration::from_secs(24 * 60 * 60))
+            .unwrap();
+        assert_eq!(removed, 1, "exactly the stale invoice should be pruned");
+        assert!(store.get_invoice(&old_h).unwrap().is_none());
+        assert!(store.get_invoice(&new_h).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_expired_invoices_drops_unparseable_timestamps() {
+        let store = MemoryStorage::new();
+        let h = hash(32);
+        let mut inv = make_invoice(&h, "tok_bad", None);
+        inv.created_at = "not-a-timestamp".to_string();
+        store.store_invoice(&inv).unwrap();
+
+        let removed = store
+            .prune_expired_invoices(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(removed, 1, "unparseable created_at must not linger");
+        assert!(store.get_invoice(&h).unwrap().is_none());
+    }
+
+    #[test]
+    fn store_invoice_evicts_oldest_at_capacity() {
+        let store = MemoryStorage::new();
+        // Fill to the cap
+        for i in 0..super::MAX_STORED_INVOICES {
+            let h = format!("{:0>64}", format!("{:x}", i));
+            let inv = make_invoice(&h, "tok", Some("9.9.9.9"));
+            store.store_invoice(&inv).unwrap();
+        }
+        // One more insert must evict the oldest rather than grow unbounded.
+        // ("f".repeat(64) cannot collide with the zero-padded hex keys above,
+        // which only reach 0x186a0.)
+        let overflow_hash = "f".repeat(64);
+        store
+            .store_invoice(&make_invoice(&overflow_hash, "tok", Some("9.9.9.9")))
+            .unwrap();
+
+        let first_hash = format!("{:0>64}", format!("{:x}", 0));
+        assert!(
+            store.get_invoice(&first_hash).unwrap().is_none(),
+            "oldest invoice should have been evicted"
+        );
+        assert!(store.get_invoice(&overflow_hash).unwrap().is_some());
+        assert_eq!(
+            store.pending_invoice_count("9.9.9.9").unwrap(),
+            super::MAX_STORED_INVOICES as u64,
+            "invoice count must stay at the cap"
+        );
+    }
+
+    #[test]
+    fn prune_stale_records_removes_only_drained_balances() {
+        let store = MemoryStorage::new();
+        let drained = hash(34);
+        let funded = hash(35);
+
+        // A record that was used and fully drained
+        store.credit(&drained, 100, Currency::Sat).unwrap();
+        store.debit(&drained, 100, Currency::Sat).unwrap();
+        // A record with funds remaining
+        store.credit(&funded, 100, Currency::Sat).unwrap();
+
+        let removed = store
+            .prune_stale_records(std::time::Duration::from_nanos(0))
+            .unwrap();
+        assert_eq!(removed, 1, "only the drained record should be pruned");
+        assert_eq!(store.balance(&funded, Currency::Sat).unwrap(), 100);
+    }
+
+    #[test]
+    fn prune_stale_records_never_touches_settlements() {
+        let store = MemoryStorage::new();
+        let h = hash(36);
+        store
+            .settle_with_credit(&h, 500, Some("secret"), Currency::Sat)
+            .unwrap();
+        store.debit(&h, 500, Currency::Sat).unwrap();
+
+        store
+            .prune_stale_records(std::time::Duration::from_nanos(0))
+            .unwrap();
+
+        assert!(
+            store.is_settled(&h).unwrap(),
+            "settlement record is the replay guard and must survive pruning"
+        );
+        // Replay must still be rejected after pruning
+        let settled_again = store
+            .settle_with_credit(&h, 500, Some("secret"), Currency::Sat)
+            .unwrap();
+        assert!(!settled_again, "replay after prune must not re-credit");
+        assert_eq!(store.balance(&h, Currency::Sat).unwrap(), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,10 +744,7 @@ pub(crate) mod test_util {
             self.inner.store_invoice(invoice)
         }
 
-        fn get_invoice(
-            &self,
-            payment_hash: &str,
-        ) -> Result<Option<StoredInvoice>, StorageError> {
+        fn get_invoice(&self, payment_hash: &str) -> Result<Option<StoredInvoice>, StorageError> {
             self.inner.get_invoice(payment_hash)
         }
 
@@ -574,7 +753,8 @@ pub(crate) mod test_util {
             payment_hash: &str,
             status_token: &str,
         ) -> Result<Option<StoredInvoice>, StorageError> {
-            self.inner.get_invoice_for_status(payment_hash, status_token)
+            self.inner
+                .get_invoice_for_status(payment_hash, status_token)
         }
 
         fn pending_invoice_count(&self, client_ip: &str) -> Result<u64, StorageError> {
@@ -588,10 +768,7 @@ pub(crate) mod test_util {
             self.inner.prune_expired_invoices(max_age)
         }
 
-        fn prune_stale_records(
-            &self,
-            max_age: std::time::Duration,
-        ) -> Result<u64, StorageError> {
+        fn prune_stale_records(&self, max_age: std::time::Duration) -> Result<u64, StorageError> {
             self.inner.prune_stale_records(max_age)
         }
     }

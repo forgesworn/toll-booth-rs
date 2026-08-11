@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Security-hardening follow-up.
+
+### Fixed
+
+- **Unauthenticated invoice-storage exhaustion closed.** `MemoryStorage`
+  now caps stored invoices at 100,000 with FIFO eviction, implements
+  `prune_expired_invoices` / `prune_stale_records` (previously no-ops), and
+  the engine records the client IP on each challenge, caps pending invoices
+  at 100 per IP, and prunes invoices older than 24h opportunistically.
+  Settlement records are deliberately never pruned: they are the replay
+  guard for `settle_with_credit`.
+- **X-Forwarded-For chain resolution.** Behind a trusted proxy the client
+  IP is now resolved by walking the header right-to-left and skipping hops
+  that are themselves trusted proxies, instead of trusting the left-most
+  entry. Proxies that *append* (e.g. nginx `$proxy_add_x_forwarded_for`)
+  can no longer be abused to rotate spoofed left-most entries and evade
+  free-tier quotas or `ip` caveats.
+- **`expires` caveat fails closed.** A macaroon carrying an unparseable
+  `expires` value is now rejected instead of silently disabling expiry
+  enforcement.
+- **Free-tier mutex poisoning fails closed.** A poisoned free-tier state
+  mutex now denies requests instead of panicking every subsequent request.
+
 ## 0.2.0 - 2026-08-08
 
 Security-hardening release (breaking, pre-1.0).

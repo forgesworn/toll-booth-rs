@@ -55,6 +55,15 @@ impl FreeTier {
     }
 }
 
+/// Deny-by-default result used when the state mutex is poisoned: a panic
+/// while holding the lock must fail closed, not panic every future request.
+fn poisoned() -> FreeTierResult {
+    FreeTierResult {
+        allowed: false,
+        remaining: 0,
+    }
+}
+
 impl IFreeTier for FreeTier {
     fn check(&self, ip: &str, _cost: u64) -> FreeTierResult {
         // Validate IP
@@ -66,7 +75,10 @@ impl IFreeTier for FreeTier {
         }
 
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(_) => return poisoned(),
+        };
 
         // Check if date has changed; if so, reset all entries
         if state.0 != today {
@@ -109,9 +121,10 @@ impl IFreeTier for FreeTier {
 
     fn reset(&self) {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let mut state = self.state.lock().unwrap();
-        state.0 = today;
-        state.1.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.0 = today;
+            state.1.clear();
+        }
     }
 }
 
@@ -152,7 +165,10 @@ impl IFreeTier for CreditFreeTier {
 
         // Zero-cost requests always pass
         if cost == 0 {
-            let state = self.state.lock().unwrap();
+            let state = match self.state.lock() {
+                Ok(s) => s,
+                Err(_) => return poisoned(),
+            };
             let spent = state.1.get(ip).map(|e| e.amount).unwrap_or(0);
             return FreeTierResult {
                 allowed: true,
@@ -161,7 +177,10 @@ impl IFreeTier for CreditFreeTier {
         }
 
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(_) => return poisoned(),
+        };
 
         // Check if date has changed; if so, reset all entries
         if state.0 != today {
@@ -206,9 +225,10 @@ impl IFreeTier for CreditFreeTier {
 
     fn reset(&self) {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let mut state = self.state.lock().unwrap();
-        state.0 = today;
-        state.1.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.0 = today;
+            state.1.clear();
+        }
     }
 }
 
@@ -445,6 +465,49 @@ mod tests {
             true,
             "Valid hex hash should be accepted"
         );
+    }
+
+    #[test]
+    fn poisoned_mutex_fails_closed() {
+        // Security: a panic while holding the state lock must not panic every
+        // subsequent request -- the tier fails closed instead.
+        let tier = FreeTier::new(10);
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _guard = tier.state.lock().unwrap();
+                    panic!("simulated panic while holding the free-tier lock");
+                })
+                .join();
+        });
+
+        let result = tier.check("192.168.1.1", 0);
+        assert!(!result.allowed, "poisoned mutex must deny, not panic");
+        assert_eq!(result.remaining, 0);
+        tier.reset(); // must not panic either
+    }
+
+    #[test]
+    fn credit_poisoned_mutex_fails_closed() {
+        let tier = CreditFreeTier::new(1000);
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _guard = tier.state.lock().unwrap();
+                    panic!("simulated panic while holding the free-tier lock");
+                })
+                .join();
+        });
+
+        let result = tier.check("192.168.1.1", 100);
+        assert!(!result.allowed, "poisoned mutex must deny, not panic");
+        // Zero-cost reads must also fail closed rather than panic
+        let zero = tier.check("192.168.1.1", 0);
+        assert!(
+            !zero.allowed,
+            "poisoned mutex must deny even zero-cost reads"
+        );
+        tier.reset();
     }
 
     #[test]

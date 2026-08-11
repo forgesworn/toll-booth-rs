@@ -276,10 +276,8 @@ mod tests {
     use crate::storage::MemoryStorage;
 
     fn test_root_key() -> RootKey {
-        RootKey::from_hex(
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        )
-        .unwrap()
+        RootKey::from_hex("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+            .unwrap()
     }
 
     fn make_request(headers: HashMap<String, String>) -> TollBoothRequest {

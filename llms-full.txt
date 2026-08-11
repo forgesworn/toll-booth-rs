@@ -425,7 +425,7 @@ impl MemoryStorage {
 }
 ```
 
-In-memory implementation. Thread-safe via `Mutex`. Suitable for tests and prototypes. Supports dual-currency (Sat + Usd) balances per payment_hash. Has overflow protection (returns error on i64 overflow). Status token comparison uses constant-time equality.
+In-memory implementation. Thread-safe via `Mutex`. Suitable for tests and prototypes. Supports dual-currency (Sat + Usd) balances per payment_hash. Has overflow protection (returns error on i64 overflow). Status token comparison uses constant-time equality. Invoice storage is bounded (100,000 entries, oldest evicted first) and `prune_expired_invoices` / `prune_stale_records` are implemented; settlement records are never pruned because they guard against payment replay.
 
 ### SqliteStorage (feature: `sqlite`)
 
@@ -443,6 +443,7 @@ pub struct TollBoothLayer { /* private */ }
 impl TollBoothLayer {
     pub fn new(engine: TollBoothEngine) -> Self;
     pub fn from_arc(engine: Arc<TollBoothEngine>) -> Self;
+    pub fn with_trusted_proxies(self, proxies: Vec<IpNet>) -> Self;
 }
 
 impl<S> Layer<S> for TollBoothLayer { ... }
@@ -460,7 +461,7 @@ let app = axum::Router::new()
 - `Challenge`: short-circuits with 402 status, JSON body, and `WWW-Authenticate` header
 - `Blocked`: short-circuits with 403 status and JSON body
 
-**IP extraction:** prefers `X-Forwarded-For` (first entry), falls back to `X-Real-IP`, defaults to `"unknown"`.
+**IP extraction:** `X-Forwarded-For`/`X-Real-IP` are honoured only when the direct connection peer is in `with_trusted_proxies`; otherwise the connection peer address is used. When honoured, XFF is resolved right-to-left, skipping hops that are themselves trusted proxies (the left-most entry is trivially spoofable behind appending proxies). With no peer address, the IP is `"unknown"` and free-tier / IP-caveat checks fail closed.
 
 **Tier extraction:** reads `X-Toll-Tier` header.
 

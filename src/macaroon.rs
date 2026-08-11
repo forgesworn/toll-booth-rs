@@ -555,19 +555,21 @@ pub fn verify_macaroon(
             }
         }
 
-        // Expires check
+        // Expires check. Fail closed: an `expires` caveat we cannot parse
+        // must reject the macaroon, not silently disable expiry enforcement.
         if let Some(expires_str) = all_caveats.get("expires") {
             let now = ctx.now.unwrap_or_else(chrono::Utc::now);
-            if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_str) {
-                if now >= expires_at {
-                    return Ok(VerifyResult {
-                        valid: false,
-                        payment_hash: id_payment_hash,
-                        credit_balance,
-                        currency,
-                        custom_caveats,
-                    });
-                }
+            let unexpired = chrono::DateTime::parse_from_rfc3339(expires_str)
+                .map(|expires_at| now < expires_at)
+                .unwrap_or(false);
+            if !unexpired {
+                return Ok(VerifyResult {
+                    valid: false,
+                    payment_hash: id_payment_hash,
+                    credit_balance,
+                    currency,
+                    custom_caveats,
+                });
             }
         }
 
@@ -717,14 +719,8 @@ mod tests {
             "app_id = myapp123".to_string(),
             "tier = premium".to_string(),
         ];
-        let mac_b64 = mint_macaroon(
-            &root_key(),
-            TEST_PAYMENT_HASH,
-            500,
-            &caveats,
-            Currency::Sat,
-        )
-        .unwrap();
+        let mac_b64 =
+            mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 500, &caveats, Currency::Sat).unwrap();
 
         let result = verify_macaroon(&root_key(), &mac_b64, None).unwrap();
         assert!(result.valid);
@@ -743,10 +739,9 @@ mod tests {
         let mac_b64 =
             mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 1000, &[], Currency::Sat).unwrap();
 
-        let wrong_key = RootKey::from_hex(
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        )
-        .unwrap();
+        let wrong_key =
+            RootKey::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
         let result = verify_macaroon(&wrong_key, &mac_b64, None).unwrap();
         assert!(!result.valid);
     }
@@ -891,14 +886,8 @@ mod tests {
     #[test]
     fn parse_macaroon_caveats_returns_all_caveats() {
         let caveats = vec!["app_id = test123".to_string()];
-        let mac_b64 = mint_macaroon(
-            &root_key(),
-            TEST_PAYMENT_HASH,
-            750,
-            &caveats,
-            Currency::Sat,
-        )
-        .unwrap();
+        let mac_b64 =
+            mint_macaroon(&root_key(), TEST_PAYMENT_HASH, 750, &caveats, Currency::Sat).unwrap();
 
         let parsed = parse_macaroon_caveats(&mac_b64).unwrap();
         assert_eq!(
@@ -947,6 +936,33 @@ mod tests {
         };
         let result2 = verify_macaroon(&root_key(), &mac_b64, Some(&ctx_after)).unwrap();
         assert!(!result2.valid, "should be invalid after expiry");
+    }
+
+    #[test]
+    fn verify_expires_malformed_fails_closed() {
+        // A macaroon carrying an `expires` caveat we cannot parse must be
+        // rejected -- treating it as absent would silently disable expiry
+        // enforcement for externally-minted macaroons.
+        let root_key_bytes = hex::decode(TEST_ROOT_KEY).unwrap();
+        let id = encode_l402_identifier(TEST_PAYMENT_HASH).unwrap();
+        let mut mac = Macaroon::create(&root_key_bytes, &id);
+        mac.add_first_party_caveat(
+            "payment_hash = deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        mac.add_first_party_caveat("credit_balance = 1000");
+        mac.add_first_party_caveat("currency = sat");
+        mac.add_first_party_caveat("expires = not-a-timestamp");
+
+        let serialised = mac.serialise_v2();
+        let mac_b64 = base64_url_encode(&serialised);
+
+        let ctx = VerifyContext {
+            path: None,
+            ip: None,
+            now: None,
+        };
+        let result = verify_macaroon(&root_key(), &mac_b64, Some(&ctx)).unwrap();
+        assert!(!result.valid, "unparseable expires caveat must fail closed");
     }
 
     // -- Security: crafted macaroon binary robustness --

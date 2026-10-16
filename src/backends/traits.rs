@@ -6,6 +6,8 @@ pub struct PaymentResult {
     pub preimage: String,
 }
 
+// async_trait adds #[must_use] to the boxed futures it returns; Clippy 1.99 flags that as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LightningBackend: Send + Sync {
     async fn create_invoice(

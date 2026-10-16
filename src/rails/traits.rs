@@ -25,6 +25,8 @@ pub enum PaymentMode {
     Session,
 }
 
+// async_trait adds #[must_use] to the boxed futures it returns; Clippy 1.99 flags that as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PaymentRail: Send + Sync {
     fn rail_type(&self) -> &str;

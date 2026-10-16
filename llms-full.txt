@@ -493,7 +493,7 @@ let app = axum::Router::new()
 
 ## Macaroon module (src/macaroon.rs)
 
-Macaroon implementation using V2 binary format with HMAC-SHA256, public as `toll_booth::macaroon`. `L402Rail` mints with no custom caveats; to add your own, call `mint_macaroon` (for example from a custom `PaymentRail`). Custom caveats reach your service as `X-Toll-Caveat-<Key>` headers (`app_id` becomes `X-Toll-Caveat-App-Id`).
+Macaroon implementation using V2 binary format with HMAC-SHA256, public as `toll_booth::macaroon`. `L402Rail` mints with no custom caveats; to add your own free-form caveats, call `mint_macaroon` (for example from a custom `PaymentRail`). Custom caveats reach your service as `X-Toll-Caveat-<Key>` headers (`app_id` becomes `X-Toll-Caveat-App-Id`).
 
 ### Public functions
 
@@ -552,11 +552,17 @@ pub struct VerifyResult {
 
 ### Reserved caveat keys
 
-`payment_hash`, `credit_balance`, `currency`, `route`, `expires`, `ip`. Custom caveats must not use these keys.
+`payment_hash`, `credit_balance`, `currency`, `route`, `expires`, `ip`. Custom caveats must not use these keys: `mint_macaroon` returns `MacaroonError::InvalidCaveat`.
+
+`mint_macaroon` is the only public mint path (the internal `Macaroon` type is not exported), so this crate cannot attach `route`, `expires` or `ip`. `verify_macaroon`, and so `L402Rail`, still enforces them on a validly signed macaroon that carries them (minted outside this crate, same V2 format and L402 identifier, same root key):
+
+- `route`: exact path, or a prefix ending in `/*`, matched against `VerifyContext.path`.
+- `expires`: RFC 3339 timestamp, checked against `VerifyContext.now` (default: current time). A macaroon past it is rejected, and so is an unparseable value.
+- `ip`: exact address, compared with `VerifyContext.ip`.
 
 ### Caveat format
 
-All caveats use `"key = value"` format (space-equals-space). Route caveats support wildcards: `route = /api/*` matches any path starting with `/api/`.
+All caveats use `"key = value"` format (space-equals-space). Route caveats, which this crate verifies but cannot mint, support wildcards: `route = /api/*` matches `/api` and any path under `/api/`.
 
 ### L402 Identifier format (66 bytes)
 

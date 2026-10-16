@@ -13,7 +13,7 @@ toll-booth is a Rust crate that adds HTTP 402 payment gating to any API. It uses
 - Free tier: configurable free requests or free credits per IP per day (IPs hashed with daily salt)
 - Tiered pricing: per-route pricing with tier keys sent via `X-Toll-Tier` header
 - Cost reconciliation: adjust credit balances after upstream responds with actual cost
-- Custom macaroon caveats: route restrictions, IP binding, expiry, plus arbitrary `key = value` pairs, minted with `toll_booth::macaroon::mint_macaroon`
+- Custom macaroon caveats: arbitrary `key = value` pairs minted with `toll_booth::macaroon::mint_macaroon` and forwarded as `X-Toll-Caveat-<Key>` headers. `route`, `expires` and `ip` caveats are enforced on verification, but this crate cannot mint them
 - axum middleware via `TollBoothLayer` (Tower Layer/Service)
 
 ## Architecture
@@ -153,6 +153,8 @@ Notes:
 ### Custom macaroon caveats
 
 `toll_booth::macaroon::mint_macaroon(root_key: &RootKey, payment_hash: &str, credit_balance: i64, custom_caveats: &[String], currency: Currency) -> Result<String, MacaroonError>`. Each caveat is `"key = value"`. The keys `payment_hash`, `credit_balance`, `currency`, `route`, `expires` and `ip` are reserved. `L402Rail` itself mints with no custom caveats; mint your own from a custom rail. Custom caveats reach your service as `X-Toll-Caveat-<Key>` headers.
+
+`mint_macaroon` is the only public mint path and rejects `route`, `expires` and `ip`, so this crate cannot attach them. `verify_macaroon`, and so `L402Rail`, still enforces them on a validly signed macaroon that carries them (minted outside this crate, same V2 format and L402 identifier, same root key): `route` is an exact path or a prefix ending in `/*`, `expires` is an RFC 3339 timestamp (an unparseable value rejects), `ip` is an exact address.
 
 ### Implementations
 

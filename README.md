@@ -247,7 +247,7 @@ pub enum PricingEntry {
 
 ## Custom macaroon caveats
 
-`L402Rail` mints macaroons with only the mandatory caveats. To attach your own, mint a macaroon with `toll_booth::macaroon::mint_macaroon`, for example from a custom `PaymentRail`:
+`L402Rail` mints macaroons with only the mandatory caveats. To attach your own free-form caveats, mint a macaroon with `toll_booth::macaroon::mint_macaroon`, for example from a custom `PaymentRail`:
 
 ```rust
 pub fn mint_macaroon(
@@ -259,7 +259,17 @@ pub fn mint_macaroon(
 ) -> Result<String, MacaroonError>; // URL-safe base64
 ```
 
-`payment_hash`, `credit_balance`, `currency`, `route`, `expires` and `ip` are reserved: `mint_macaroon` rejects them in `custom_caveats` with `MacaroonError::InvalidCaveat`, as it does a caveat that is not in `key = value` form. On verification `L402Rail` enforces three of them when present: `route` (an exact path, or a prefix ending in `/*`), `expires` (an RFC 3339 timestamp; an unparseable value rejects the macaroon) and `ip` (an exact address). Any other caveat is added to the request and response headers of a charged request as `X-Toll-Caveat-<Key>`, with `_` in the key becoming `-` and each segment capitalised (`app_id` becomes `X-Toll-Caveat-App-Id`).
+`payment_hash`, `credit_balance`, `currency`, `route`, `expires` and `ip` are reserved: `mint_macaroon` rejects them in `custom_caveats` with `MacaroonError::InvalidCaveat`, as it does a caveat that is not in `key = value` form. Any other caveat is added to the request and response headers of a charged request as `X-Toll-Caveat-<Key>`, with `_` in the key becoming `-` and each segment capitalised (`app_id` becomes `X-Toll-Caveat-App-Id`).
+
+### Route, expiry and IP restrictions
+
+This crate cannot attach `route`, `expires` or `ip`. `mint_macaroon` is the only public way to mint a macaroon and it rejects those keys, and the internal `Macaroon` type that could add them is not exported. Verification does enforce them: `verify_macaroon`, and so `L402Rail`, rejects a validly signed macaroon that carries one and the request does not satisfy it.
+
+- `route`: an exact path, or a prefix ending in `/*`, matched against the request path.
+- `expires`: an RFC 3339 timestamp. A macaroon past it is rejected, and so is one whose value cannot be parsed.
+- `ip`: an exact address, compared with the client IP, resolved as described under [Free tier](#free-tier).
+
+To use them, the macaroon has to be minted outside this crate, in the same V2 format with an L402 identifier and signed with the same root key.
 
 ## Free tier
 

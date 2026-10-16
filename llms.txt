@@ -7,13 +7,13 @@ toll-booth is a Rust crate that adds HTTP 402 payment gating to any API. It uses
 ## Key features
 
 - Credit-balance model: one Lightning payment funds multiple requests, with automatic debit per call
-- Bring-your-own backend: implement `LightningBackend` for any Lightning node (Phoenixd included)
-- Bring-your-own storage: implement `StorageBackend` for any store (in-memory and SQLite included)
+- Bring-your-own backend: implement `LightningBackend` for any Lightning node (a Phoenixd backend is planned, not yet implemented)
+- Bring-your-own storage: implement `StorageBackend` for any store (`MemoryStorage` included; a SQLite backend is planned, not yet implemented)
 - Pluggable payment rails: `PaymentRail` trait supports per-request, credit, and session modes
 - Free tier: configurable free requests or free credits per IP per day (IPs hashed with daily salt)
 - Tiered pricing: per-route pricing with tier keys sent via `X-Toll-Tier` header
 - Cost reconciliation: adjust credit balances after upstream responds with actual cost
-- Custom macaroon caveats: route restrictions, IP binding, expiry, plus arbitrary key-value pairs
+- Custom macaroon caveats: route restrictions, IP binding, expiry, plus arbitrary `key = value` pairs, minted with `toll_booth::macaroon::mint_macaroon`
 - axum middleware via `TollBoothLayer` (Tower Layer/Service)
 
 ## Architecture
@@ -28,37 +28,51 @@ Request -> TollBoothLayer -> TollBoothEngine
                                 +-- LightningBackend (invoice creation)
                                 |
                             TollBoothResult:
-                              Proxy   -> forward to handler
+                              Proxy     -> forward to the wrapped axum service
                               Challenge -> 402 + WWW-Authenticate
-                              Pass    -> unpriced route
-                              Blocked -> 403
+                              Pass      -> unpriced route, forward
+                              Blocked   -> 500 (payment infrastructure failure)
 ```
 
 ## Quick start
 
-```toml
-[dependencies]
-toll-booth = { version = "0.1", features = ["l402", "axum-middleware"] }
+```sh
+cargo add toll-booth axum@0.8
+cargo add tokio --features macros,rt-multi-thread,net
 ```
 
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+toll-booth = { version = "0.2", features = ["l402", "axum-middleware"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+```
+
+`async-trait = "0.1"` is also needed to implement `LightningBackend`, and `ipnet = "2"` to configure trusted proxies.
+
 ```rust
+use std::net::SocketAddr;
 use std::sync::Arc;
 use toll_booth::{
-    TollBoothEngine, TollBoothConfig,
-    L402Rail, L402RailConfig,
-    MemoryStorage,
-    TollBoothLayer,
-    PricingEntry,
+    L402Rail, L402RailConfig, MemoryStorage, PricingEntry, RootKey, StorageBackend,
+    TollBoothConfig, TollBoothEngine, TollBoothLayer,
 };
 
 #[tokio::main]
 async fn main() {
-    let storage = Arc::new(MemoryStorage::new());
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemoryStorage::new());
+
+    // 64 hex characters (32 bytes). Generate one with: openssl rand -hex 32
+    let root_key = RootKey::from_hex(&std::env::var("L402_ROOT_KEY").expect("L402_ROOT_KEY not set"))
+        .expect("L402_ROOT_KEY must be 64 hex characters");
 
     let l402 = L402Rail::new(L402RailConfig {
-        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
+        root_key,
         storage: storage.clone(),
-        default_amount: 100,
+        default_amount: 100, // sats; invoice amount when the matched price has no `sats`
+        // DEVELOPMENT ONLY: no invoice, random payment_hash, so no client can pay. Do not deploy.
         backend: None,
         service_name: Some("My API".to_string()),
     });
@@ -69,8 +83,6 @@ async fn main() {
     let engine = TollBoothEngine::new(TollBoothConfig {
         storage,
         pricing,
-        upstream: "http://127.0.0.1:8080".into(),
-        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
         rails: vec![Box::new(l402)],
         ..Default::default()
     })
@@ -81,35 +93,74 @@ async fn main() {
         .layer(TollBoothLayer::new(engine));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // ConnectInfo supplies the client IP; without it the IP is "unknown" and the free tier is never granted.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
 }
 ```
+
+Notes:
+
+- `L402_ROOT_KEY` is exactly 64 hex characters. `RootKey::from_hex(&str) -> Result<RootKey, MacaroonError>` fails with `MacaroonError::InvalidRootKey` otherwise.
+- `L402RailConfig::root_key` is a `RootKey`. `TollBoothConfig::root_key` is an `Option<RootKey>` the engine never reads, so the two need not match; leave it `None`.
+- `TollBoothLayer` forwards allowed requests to the axum service it wraps. It never contacts `TollBoothConfig::upstream` (default: empty string), which is only copied into `Proxy` and `Pass` results for callers of `TollBoothEngine::handle`.
+- `backend: None` is for development only. `L402Rail` always verifies `SHA256(preimage) == payment_hash` and never calls `check_invoice`; with `None` the invoice is empty and the hash is random, so nobody can authenticate.
 
 ## Public API surface
 
 ### Core types
 
 - `TollBoothEngine` -- main engine, created from `TollBoothConfig`
-- `TollBoothConfig` -- storage, pricing table, upstream URL, root key, rails, free tier
-- `TollBoothResult` -- enum: `Proxy`, `Challenge`, `Pass`, `Blocked`
+- `TollBoothConfig` -- `storage: Arc<dyn StorageBackend>`, `pricing`, `upstream: String`, `root_key: Option<RootKey>` (never read by the engine), `rails: Vec<Box<dyn PaymentRail>>`, `free_tier: Option<FreeTierConfig>`, `service_name: Option<String>`
+- `RootKey` -- macaroon root key; `RootKey::from_hex(&str) -> Result<RootKey, MacaroonError>` (64 hex characters); `Clone`, zeroises on drop, redacts `Debug`. Required by `L402RailConfig::root_key`
+- `TollBoothResult` -- enum: `Proxy`, `Challenge`, `Pass`, `Blocked` (see below)
 - `TollBoothRequest` -- method, path, headers, IP, optional tier
-- `PricingEntry` -- `Simple(u64)`, `Detailed(PriceInfo)`, `Tiered(HashMap<String, u64>)`
+- `PricingEntry` -- `Simple(u64)`, `Detailed(PriceInfo)`, `Tiered(HashMap<String, u64>)`; tiered entries must have a `"default"` key or `TollBoothEngine::new` returns `TollBoothError::Config`
+- `PriceInfo` -- `{ sats: Option<u64>, usd: Option<u64> }`; only `sats` is charged, `usd` is advertised in `HEAD` responses; constructors `PriceInfo::sats(n)`, `PriceInfo::usd(n)`
 - `FreeTierConfig` -- `Requests(u64)` or `Credits(u64)`
-- `Currency` -- `Sat` or `Usd`
+- `Currency` -- `Sat` (default) or `Usd`; a separate balance bucket per payment hash, no conversion
+
+### TollBoothResult variants
+
+- `Proxy { upstream, headers, payment_hash, request_id, estimated_cost, credit_balance, free_remaining, tier }` -- a rail authenticated the request and the balance covered the route cost, or the free tier allowed it
+- `Challenge { status: 402, headers, body }` -- no or invalid credentials and no free quota, insufficient balance, a replayed PerRequest/Session payment, a `HEAD` request (price only), or an invalid or unknown `X-Toll-Tier`
+- `Pass { upstream, headers }` -- the request path is not in the pricing table
+- `Blocked { status: 500, body: {"error": "payment infrastructure unavailable"} }` -- a rail's `verify` returned `Err`, or storage `debit` or `settle` failed; fails closed instead of granting free access
+
+### Engine methods
+
+- `TollBoothEngine::new(config: TollBoothConfig) -> Result<TollBoothEngine, TollBoothError>`
+- `async fn handle(&self, req: &TollBoothRequest) -> TollBoothResult`
+- `fn reconcile(&self, request_id: &str, actual_cost: u64) -> ReconcileResult` -- synchronous; `request_id` is `Proxy::request_id` (not the payment hash), one-shot; refunds `estimated - actual` via `adjust_credits` (negative debits more). `TollBoothLayer` does not forward `request_id`, so call `handle` yourself to use it
 
 ### Traits
 
-- `PaymentRail` -- `detect()`, `challenge()`, `verify()` for any payment scheme
-- `LightningBackend` -- `create_invoice()`, `check_invoice()`, optional `send_payment()`
-- `StorageBackend` -- `credit()`, `debit()`, `balance()`, `settle()`, invoice storage, pruning
+- `PaymentRail` (`#[async_trait]`, `Send + Sync`):
+  - `fn rail_type(&self) -> &str`
+  - `fn credit_supported(&self) -> bool`
+  - `fn detect(&self, req: &TollBoothRequest) -> bool`
+  - `async fn challenge(&self, route: &str, price: &PriceInfo) -> Result<ChallengeFragment, RailError>`
+  - `async fn verify(&self, req: &TollBoothRequest) -> Result<RailVerifyResult, RailError>`
+  - `RailVerifyResult.mode` is a `PaymentMode`: `Credit` debits the route cost from a balance; `PerRequest` and `Session` call `StorageBackend::settle` once and challenge again on replay
+- `LightningBackend` (`#[async_trait]`, `Send + Sync`):
+  - `async fn create_invoice(&self, amount_sats: u64, memo: Option<&str>) -> Result<Invoice, BackendError>`
+  - `async fn check_invoice(&self, payment_hash: &str) -> Result<InvoiceStatus, BackendError>`
+  - optional `async fn send_payment(&self, bolt11: &str) -> Result<toll_booth::backends::PaymentResult, BackendError>`, default `Err(BackendError::NotSupported)`
+  - `L402Rail` calls only `create_invoice`
+- `StorageBackend` (synchronous, `Send + Sync`, all methods required): `credit()`, `debit()`, `balance()`, `adjust_credits(payment_hash, delta: i64, currency) -> Result<i64, _>`, `settle()`, `settle_with_credit(payment_hash, amount, settlement_secret: Option<&str>, currency) -> Result<bool, _>`, `is_settled()`, `get_settlement_secret()`, `store_invoice()`, `get_invoice()`, `get_invoice_for_status()`, `pending_invoice_count()`, `prune_expired_invoices()`, `prune_stale_records()`
+
+### Custom macaroon caveats
+
+`toll_booth::macaroon::mint_macaroon(root_key: &RootKey, payment_hash: &str, credit_balance: i64, custom_caveats: &[String], currency: Currency) -> Result<String, MacaroonError>`. Each caveat is `"key = value"`. The keys `payment_hash`, `credit_balance`, `currency`, `route`, `expires` and `ip` are reserved. `L402Rail` itself mints with no custom caveats; mint your own from a custom rail. Custom caveats reach your service as `X-Toll-Caveat-<Key>` headers.
 
 ### Implementations
 
 - `L402Rail` -- L402 payment rail (macaroon + Lightning preimage verification)
 - `MemoryStorage` -- in-memory storage for tests and prototypes
-- `SqliteStorage` -- SQLite storage (feature: `sqlite`)
-- `PhoenixdBackend` -- Phoenixd Lightning node (feature: `phoenixd`)
-- `TollBoothLayer` -- Tower Layer for axum (feature: `axum-middleware`)
+- `TollBoothLayer` -- Tower Layer for axum (feature: `axum-middleware`); `new(engine)`, `from_arc(Arc<TollBoothEngine>)`, `with_trusted_proxies(Vec<ipnet::IpNet>)`. The client IP is read from `ConnectInfo<SocketAddr>` (serve with `into_make_service_with_connect_info::<SocketAddr>()`); `X-Forwarded-For` and `X-Real-IP` are honoured only from trusted proxies
+
+Not implemented yet: `SqliteStorage` and `PhoenixdBackend`. The `sqlite` and `phoenixd` features only enable the `rusqlite` and `reqwest` dependencies, and their modules are empty placeholders.
 
 ### L402 protocol flow
 
@@ -128,8 +179,8 @@ async fn main() {
 |-------------------|---------|------------------------------------------|
 | `l402`            | yes     | L402 payment rail                        |
 | `axum-middleware` | yes     | Tower Layer for axum                     |
-| `sqlite`          | yes     | SQLite storage backend (bundled)         |
-| `phoenixd`        | no      | Phoenixd Lightning node backend          |
+| `sqlite`          | yes     | Reserved (enables `rusqlite`); `SqliteStorage` not yet implemented |
+| `phoenixd`        | no      | Reserved (enables `reqwest`); `PhoenixdBackend` not yet implemented |
 
 ## Links
 

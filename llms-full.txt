@@ -13,21 +13,27 @@ Licence: MIT
 
 ```toml
 [dependencies]
-toll-booth = { version = "0.1", features = ["l402", "axum-middleware"] }
+toll-booth = { version = "0.2", features = ["l402", "axum-middleware"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# async-trait = "0.1"   # only to implement LightningBackend
+# ipnet = "2"           # only to configure trusted proxies
 ```
+
+Or: `cargo add toll-booth axum@0.8` and `cargo add tokio --features macros,rt-multi-thread,net`.
 
 ### Feature flags
 
 | Feature           | Default | Dependencies                             | What it enables                          |
 |-------------------|---------|------------------------------------------|------------------------------------------|
 | `l402`            | yes     | (none extra)                             | L402 payment rail                        |
-| `axum-middleware` | yes     | axum 0.8, tower 0.5, http 1             | Tower Layer for axum                     |
-| `sqlite`          | yes     | rusqlite 0.34 (bundled)                  | SQLite storage backend                   |
-| `phoenixd`        | no      | reqwest 0.12                             | Phoenixd Lightning node backend          |
+| `axum-middleware` | yes     | axum 0.8, tower 0.5, http 1, ipnet 2, pin-project-lite 0.2 | Tower Layer for axum |
+| `sqlite`          | yes     | rusqlite 0.34 (bundled)                  | Reserved: `SqliteStorage` not yet implemented |
+| `phoenixd`        | no      | reqwest 0.12                             | Reserved: `PhoenixdBackend` not yet implemented |
 
 ### Always-included dependencies
 
-hmac 0.12, sha2 0.10, subtle 2.6, rand 0.8, hex 0.4, base64 0.22, serde 1, serde_json 1, chrono 0.4, async-trait 0.1, regex 1, once_cell 1, thiserror 2.
+hmac 0.12, sha2 0.10, subtle 2.6, rand 0.8, hex 0.4, base64 0.22, serde 1, serde_json 1, chrono 0.4, async-trait 0.1, regex 1, once_cell 1, thiserror 2, zeroize 1.
 
 ---
 
@@ -36,8 +42,9 @@ hmac 0.12, sha2 0.10, subtle 2.6, rand 0.8, hex 0.4, base64 0.22, serde 1, serde
 ```rust
 pub use types::*;
 pub use engine::{FreeTierConfig, TollBoothConfig, TollBoothEngine};
+pub use macaroon::RootKey;
 pub use storage::{StorageBackend, MemoryStorage};
-pub use backends::LightningBackend;
+pub use backends::LightningBackend;   // PaymentResult is at toll_booth::backends::PaymentResult
 pub use rails::{PaymentRail, L402Rail, L402RailConfig, ChallengeFragment, RailVerifyResult, PaymentMode};
 #[cfg(feature = "axum-middleware")]
 pub use middleware::TollBoothLayer;
@@ -73,6 +80,8 @@ impl PriceInfo {
 }
 ```
 
+Only `sats` is charged. `usd` is advertised in `HEAD` responses (`X-L402-Price-Usd`, `price.usd`) and never debited. A price with `sats: None` costs 0 for an authenticated request, and its challenge uses `L402RailConfig::default_amount`. The source defines no unit for `usd`.
+
 ### PricingEntry
 
 ```rust
@@ -88,6 +97,8 @@ impl PricingEntry {
     pub fn tier_price(&self, tier: &str) -> Option<PriceInfo>;
 }
 ```
+
+Pricing lookup is an exact match on the request path. `Tiered` entries must contain a `"default"` key, otherwise `TollBoothEngine::new` returns `TollBoothError::Config("tiered pricing for route \"<route>\" is missing the required \"default\" tier")`. `normalise()` on a tiered entry returns the `"default"` price. With no `X-Toll-Tier` header the default tier applies; an invalid tier (not 1 to 32 characters of lowercase letters, digits, `_`, `-`) or an unknown tier gets a 402 challenge at the default price before credentials or the free tier are considered. The tier is client-chosen and advisory.
 
 ### TollBoothRequest
 
@@ -113,6 +124,7 @@ pub enum TollBoothResult {
         upstream: String,
         headers: HashMap<String, String>,
         payment_hash: Option<String>,
+        request_id: Option<String>,         // unique per request; pass to reconcile()
         estimated_cost: Option<u64>,
         credit_balance: Option<i64>,
         free_remaining: Option<u64>,
@@ -128,11 +140,17 @@ pub enum TollBoothResult {
         headers: HashMap<String, String>,
     },
     Blocked {
-        status: u16,
-        body: serde_json::Value,
+        status: u16,                        // always 500 today
+        body: serde_json::Value,            // {"error": "payment infrastructure unavailable"}
     },
 }
 ```
+
+**When each variant is returned:**
+- `Pass`: the request path is not in the pricing table.
+- `Proxy`: a rail authenticated the request and (in Credit mode) the debit succeeded, or a PerRequest/Session payment settled for the first time, or the free tier allowed it.
+- `Challenge`: no or invalid credentials and no free quota, insufficient balance, replayed PerRequest/Session payment, a `HEAD` request (price headers only), or an invalid or unknown `X-Toll-Tier`.
+- `Blocked`: a rail's `verify` returned `Err`, or storage `debit` or `settle` failed. The engine fails closed rather than falling through to the free tier.
 
 ### Invoice types
 
@@ -237,13 +255,13 @@ pub struct TollBoothConfig {
     pub storage: Arc<dyn StorageBackend>,
     pub pricing: HashMap<String, PricingEntry>,
     pub upstream: String,
-    pub root_key: String,                          // 32-byte hex
+    pub root_key: Option<RootKey>,                 // never read by the engine; rails hold their own keys
     pub rails: Vec<Box<dyn PaymentRail>>,
     pub free_tier: Option<FreeTierConfig>,
     pub service_name: Option<String>,
 }
 
-impl Default for TollBoothConfig { ... }  // empty/zero defaults
+impl Default for TollBoothConfig { ... }  // MemoryStorage, empty pricing, upstream "", root_key None, no rails, no free tier
 ```
 
 ### TollBoothEngine
@@ -254,7 +272,7 @@ pub struct TollBoothEngine { /* private */ }
 impl TollBoothEngine {
     pub fn new(config: TollBoothConfig) -> Result<Self, TollBoothError>;
     pub async fn handle(&self, req: &TollBoothRequest) -> TollBoothResult;
-    pub fn reconcile(&self, payment_hash: &str, actual_cost: u64) -> ReconcileResult;
+    pub fn reconcile(&self, request_id: &str, actual_cost: u64) -> ReconcileResult;  // synchronous
 }
 ```
 
@@ -270,9 +288,11 @@ impl TollBoothEngine {
 6. If all else fails: generate 402 `Challenge` from all rails.
 
 **`reconcile()` flow:**
-- Compares estimated cost (tracked per payment_hash for 60s) against actual cost
-- If overcharged: refunds the difference via `storage.adjust_credits()`
-- Returns `ReconcileResult { adjusted, new_balance, delta }`
+- `request_id` comes from `TollBoothResult::Proxy::request_id`, not the payment hash. It is one-shot: the estimate is removed on the first call.
+- Compares the estimate for that `request_id` against `actual_cost`; estimates older than 60s are dropped once 10,000 are held
+- Calls `storage.adjust_credits(payment_hash, estimated - actual, currency)`: a positive difference refunds, a negative one debits more
+- Returns `ReconcileResult { adjusted, new_balance, delta }`; unknown ids and equal costs return `adjusted: false, new_balance: 0, delta: 0`
+- `TollBoothLayer` does not forward `request_id` or `payment_hash` to handlers, so call `TollBoothEngine::handle` directly to reconcile
 
 ---
 
@@ -319,10 +339,10 @@ pub enum PaymentMode {
 
 ```rust
 pub struct L402RailConfig {
-    pub root_key: String,                              // 32-byte hex
+    pub root_key: RootKey,                             // RootKey::from_hex(64 hex chars)
     pub storage: Arc<dyn StorageBackend>,
     pub default_amount: u64,                           // fallback sats when price has no sats field
-    pub backend: Option<Arc<dyn LightningBackend>>,    // None = random payment_hash (dev mode)
+    pub backend: Option<Arc<dyn LightningBackend>>,    // None = dev only: empty invoice, random payment_hash, nobody can pay
     pub service_name: Option<String>,                  // memo for invoices
 }
 
@@ -379,9 +399,11 @@ pub struct PaymentResult {
 }
 ```
 
+`L402Rail` calls only `create_invoice`. Payment is verified by `SHA256(preimage) == payment_hash`; `check_invoice` and `send_payment` are never called by this crate. `send_payment` is optional and defaults to `Err(BackendError::NotSupported)`.
+
 ### PhoenixdBackend (feature: `phoenixd`)
 
-Connects to a Phoenixd Lightning node via HTTP API.
+Not implemented yet. `src/backends/phoenixd.rs` is a placeholder and the feature only enables the `reqwest` dependency.
 
 ---
 
@@ -429,7 +451,7 @@ In-memory implementation. Thread-safe via `Mutex`. Suitable for tests and protot
 
 ### SqliteStorage (feature: `sqlite`)
 
-SQLite-backed implementation using bundled rusqlite. No system dependency.
+Not implemented yet. `src/storage/sqlite.rs` is a placeholder and the feature only enables the `rusqlite` dependency.
 
 ---
 
@@ -459,23 +481,25 @@ let app = axum::Router::new()
 **Behaviour:**
 - `Proxy` / `Pass`: injects toll-booth headers into both request (for downstream handlers) and response (for client observability), then forwards to inner service
 - `Challenge`: short-circuits with 402 status, JSON body, and `WWW-Authenticate` header
-- `Blocked`: short-circuits with 403 status and JSON body
+- `Blocked`: short-circuits with the engine-supplied status (500) and JSON body
 
-**IP extraction:** `X-Forwarded-For`/`X-Real-IP` are honoured only when the direct connection peer is in `with_trusted_proxies`; otherwise the connection peer address is used. When honoured, XFF is resolved right-to-left, skipping hops that are themselves trusted proxies (the left-most entry is trivially spoofable behind appending proxies). With no peer address, the IP is `"unknown"` and free-tier / IP-caveat checks fail closed.
+**IP extraction:** the peer address comes from axum's `ConnectInfo<SocketAddr>`, so serve with `axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())`. `X-Forwarded-For`/`X-Real-IP` are honoured only when the direct connection peer is in `with_trusted_proxies(Vec<ipnet::IpNet>)` (`ipnet` is not re-exported); otherwise the connection peer address is used. When honoured, XFF is resolved right-to-left, skipping hops that are themselves trusted proxies (the left-most entry is trivially spoofable behind appending proxies). With no peer address, the IP is `"unknown"` and free-tier / IP-caveat checks fail closed.
 
-**Tier extraction:** reads `X-Toll-Tier` header.
+**Tier extraction:** reads `X-Toll-Tier` header. The layer strips the client's header before forwarding and sets it only from engine state.
+
+**Upstream:** the layer forwards to the wrapped axum service and never contacts `TollBoothConfig::upstream`.
 
 ---
 
 ## Macaroon module (src/macaroon.rs)
 
-Internal macaroon implementation using V2 binary format with HMAC-SHA256.
+Macaroon implementation using V2 binary format with HMAC-SHA256, public as `toll_booth::macaroon`. `L402Rail` mints with no custom caveats; to add your own, call `mint_macaroon` (for example from a custom `PaymentRail`). Custom caveats reach your service as `X-Toll-Caveat-<Key>` headers (`app_id` becomes `X-Toll-Caveat-App-Id`).
 
 ### Public functions
 
 ```rust
 pub fn mint_macaroon(
-    root_key_hex: &str,       // 32-byte hex string
+    root_key: &RootKey,       // RootKey::from_hex(64 hex chars)
     payment_hash: &str,       // 64 hex chars
     credit_balance: i64,
     custom_caveats: &[String], // "key = value" format
@@ -483,7 +507,7 @@ pub fn mint_macaroon(
 ) -> Result<String, MacaroonError>;  // returns URL-safe base64
 
 pub fn verify_macaroon(
-    root_key_hex: &str,
+    root_key: &RootKey,
     macaroon_b64: &str,
     context: Option<&VerifyContext>,
 ) -> Result<VerifyResult, MacaroonError>;
@@ -491,6 +515,17 @@ pub fn verify_macaroon(
 pub fn parse_macaroon_caveats(
     macaroon_b64: &str,
 ) -> Result<HashMap<String, String>, MacaroonError>;
+```
+
+### RootKey
+
+```rust
+pub struct RootKey { /* 32 bytes in zeroising memory */ }
+
+impl RootKey {
+    pub fn from_hex(hex_str: &str) -> Result<RootKey, MacaroonError>;  // exactly 64 hex chars, else InvalidRootKey
+}
+// Clone; Debug prints "RootKey([REDACTED])"; zeroised on drop.
 ```
 
 ### VerifyContext
@@ -564,13 +599,11 @@ free_tier: Some(FreeTierConfig::Credits(500)),   // 500 free sats per IP per day
 ## Complete usage example
 
 ```rust
+use std::net::SocketAddr;
 use std::sync::Arc;
 use toll_booth::{
-    TollBoothEngine, TollBoothConfig, FreeTierConfig,
-    L402Rail, L402RailConfig,
-    MemoryStorage,
-    TollBoothLayer,
-    PricingEntry,
+    FreeTierConfig, L402Rail, L402RailConfig, MemoryStorage, PricingEntry, RootKey,
+    StorageBackend, TollBoothConfig, TollBoothEngine, TollBoothLayer,
 };
 
 async fn chat_handler() -> &'static str {
@@ -580,45 +613,50 @@ async fn chat_handler() -> &'static str {
 #[tokio::main]
 async fn main() {
     // 1. Storage
-    let storage = Arc::new(MemoryStorage::new());
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemoryStorage::new());
 
-    // 2. L402 payment rail
+    // 2. Root key: exactly 64 hex characters (generate with `openssl rand -hex 32`)
+    let root_key = RootKey::from_hex(&std::env::var("L402_ROOT_KEY").expect("L402_ROOT_KEY not set"))
+        .expect("L402_ROOT_KEY must be 64 hex characters");
+
+    // 3. L402 payment rail
     let l402 = L402Rail::new(L402RailConfig {
-        root_key: std::env::var("L402_ROOT_KEY")
-            .expect("L402_ROOT_KEY must be a 64-char hex string"),
+        root_key,
         storage: storage.clone(),
-        default_amount: 100,        // sats, used when price has no sats field
-        backend: None,              // None = dev mode (random payment hashes)
+        default_amount: 100,        // sats, used when the matched price has no sats field
+        backend: None,              // DEVELOPMENT ONLY: empty invoice, random payment hash, nobody can pay
         service_name: Some("My Chat API".to_string()),
     });
 
-    // 3. Pricing table
+    // 4. Pricing table (exact path match)
     let mut pricing = std::collections::HashMap::new();
     pricing.insert("/v1/chat".to_string(), PricingEntry::Simple(100));
     pricing.insert("/v1/image".to_string(), PricingEntry::Simple(500));
 
-    // 4. Engine
+    // 5. Engine (root_key and upstream are left at their defaults: the layer
+    //    uses neither)
     let engine = TollBoothEngine::new(TollBoothConfig {
         storage,
         pricing,
-        upstream: "http://127.0.0.1:8080".into(),
-        root_key: std::env::var("L402_ROOT_KEY").unwrap(),
         rails: vec![Box::new(l402)],
-        free_tier: Some(FreeTierConfig::Requests(10)),  // 10 free per day
+        free_tier: Some(FreeTierConfig::Requests(10)),  // 10 free per IP per day
         service_name: Some("My Chat API".to_string()),
         ..Default::default()
     })
     .unwrap();
 
-    // 5. axum app with toll-booth middleware
+    // 6. axum app with toll-booth middleware
     let app = axum::Router::new()
         .route("/v1/chat", axum::routing::post(chat_handler))
         .layer(TollBoothLayer::new(engine));
 
-    // 6. Serve
+    // 7. Serve. ConnectInfo supplies the client IP; without it the IP is
+    //    "unknown" and the free tier is never granted.
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Listening on :3000");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
 }
 ```
 

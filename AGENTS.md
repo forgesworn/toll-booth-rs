@@ -27,9 +27,9 @@ src/
   macaroon.rs         RootKey and macaroon handling
   free_tier.rs        free-tier request/credit tracking
   types.rs            Currency, PriceInfo, PricingEntry and other shared types
-  backends/           LightningBackend trait and the phoenixd backend
+  backends/           LightningBackend trait; phoenixd.rs is an empty placeholder
   rails/               PaymentRail trait and the L402Rail implementation
-  storage/            StorageBackend trait, MemoryStorage, SqliteStorage
+  storage/            StorageBackend trait, MemoryStorage; sqlite.rs is an empty placeholder
   middleware/         TollBoothLayer (axum), gated by the axum-middleware feature
 ```
 
@@ -39,8 +39,8 @@ src/
 |---------|---------|------|
 | `l402` | yes | L402 payment rail (macaroon + Lightning preimage) |
 | `axum-middleware` | yes | `TollBoothLayer`, a Tower `Layer` for axum |
-| `sqlite` | yes | `SqliteStorage` (bundled SQLite, no system dependency) |
-| `phoenixd` | no | Phoenixd Lightning node backend |
+| `sqlite` | yes | Reserved: enables `rusqlite`; `SqliteStorage` is not implemented yet |
+| `phoenixd` | no | Reserved: enables `reqwest`; `PhoenixdBackend` is not implemented yet |
 
 ## Conventions
 
@@ -58,7 +58,8 @@ src/
 - `middleware` (and `TollBoothLayer`) only exists under the `axum-middleware`
   feature; code referencing it must be behind the same `#[cfg(feature = ...)]`
   or the default feature set.
-- `SqliteStorage` only exists under the `sqlite` feature.
+- `SqliteStorage` and `PhoenixdBackend` do not exist yet; the `sqlite` and `phoenixd`
+  features only gate empty placeholder modules. Do not document or import them.
 - Free-tier checks run only after every configured payment rail is exhausted;
   do not reorder that.
 - Security reports go through GitHub Security Advisories per `SECURITY.md`,

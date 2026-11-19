@@ -4,6 +4,12 @@
 
 toll-booth is a Rust crate that adds HTTP 402 payment gating to any API. It uses the L402 protocol (macaroons + Lightning invoices) to challenge unauthenticated requests, verify payments via preimage, and manage credit balances. Designed as a Tower Layer, it drops straight into axum.
 
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/toll-booth-rs): Canonical source repository, documentation and release information.
+
 ## Key features
 
 - Credit-balance model: one Lightning payment funds multiple requests, with automatic debit per call
